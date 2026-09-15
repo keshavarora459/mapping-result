@@ -847,28 +847,7 @@ class CoordinatorAgent(ConversableAgent):
             "rls": build_security_contract(data.get("section_access"), tables), "data_model": {},
             "lineage": [], "limitations_summary": [], "object_inventory": {}, "section_status": [],
             "extraction": {}, "master_objects": [], "media": media, "snapshots": [], "data_files": data_files_out,
-            "conversion_summary": summary, "llm_status": self.summary_builder.build_llm_status(),
-            
-            # BEST/reference JSON structural alignment mapping
-            "project_name": app_name,
-            "datasources": connections,
-            "dashboard_objects": visuals_struct.get("sheet_visuals", []),
-            "all_dashboard_objects": visuals_struct.get("sheet_visuals", []),
-            "dashboard_objects_summary": {},
-            "styling_summary": {},
-            "sheets": visuals_struct.get("sheets", []),
-            "unmapped_objects": [],
-            "unmapped_summary": {},
-            "parameters": converted_variables,
-            "sets": [],
-            "formatting_and_styling": app_layout.get("theme", {}) if app_layout else {},
-            "actions": [],
-            "embedded_assets": media,
-            "permissions": build_security_contract(data.get("section_access"), tables),
-            "artifacts": [],
-            "security": build_security_contract(data.get("section_access"), tables),
-            "cosmos_db": {},
-            "logs": []
+            "conversion_summary": summary, "llm_status": self.summary_builder.build_llm_status()
         }
 
         gate_eval = ProductionGate.evaluate(out_payload)
