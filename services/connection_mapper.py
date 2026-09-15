@@ -1,0 +1,861 @@
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+# Any identifier interpolated into generated M text must be wrapped in
+# #"..." once it contains anything besides letters/digits/underscore -
+# Qlik table/column names routinely carry spaces and hyphens.
+_UNSAFE_M_IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
+
+# Best-effort extraction of an embedded SQL statement out of a Qlik LOAD
+# script (`qlik_query`/`load_statement`). Real Qlik apps commonly load via
+# `LOAD ... ; SQL SELECT ...` or embed the raw SELECT directly - either way,
+# the SELECT text itself is what a NativeQuery M call needs.
+_EMBEDDED_SQL = re.compile(r"SELECT\s+.+", re.IGNORECASE | re.DOTALL)
+_FILE_LOAD = re.compile(r"FROM\s+\[?(?:lib://)?([^/\]\r\n]+)/([^\]\r\n]+)\]?", re.IGNORECASE)
+_FILE_LOAD_SIMPLE = re.compile(r"FROM\s+\[?([^\]\r\n]+\.(?:csv|xlsx|xls|txt|qvd))\]?", re.IGNORECASE)
+
+
+def escape_m_identifier(name: str) -> str:
+    """Wrap `name` in #"..." unless it's already a safe bare M identifier."""
+    if not name:
+        return name
+    return name if _UNSAFE_M_IDENTIFIER.match(name) else f'#"{name}"'
+
+
+def escape_m_string(value: str) -> str:
+    """Escape a value for embedding inside an M "..." string literal.
+
+    M escapes an embedded double-quote by doubling it. SQL text routinely
+    carries double-quoted identifiers (`SELECT "COURSE_ID" FROM ...`), which
+    would otherwise terminate the M string literal early and produce invalid
+    M (this is exactly what real Snowflake-quoted-identifier SQL looks like).
+    """
+    return (value or "").replace('"', '""')
+
+
+# Fabric column datatype -> M type literal, for Table.TransformColumnTypes.
+_M_TYPE_BY_FABRIC_TYPE = {
+    "double": "type number",
+    "int64": "Int64.Type",
+    "dateTime": "type datetime",
+    "boolean": "type logical",
+}
+
+
+def type_transforms_from_columns(columns: Optional[List[Dict[str, Any]]]) -> str:
+    """Build a `{"Col", type X}, ...` list from the table's already-resolved
+    Fabric column types, for a `Table.TransformColumnTypes` step.
+
+    Reusing the real per-column types (rather than a hardcoded guess) is what
+    makes this correct for whatever table it's actually building - see the
+    INLINE/REST/CSV/Excel branches in build_table_mquery.
+    """
+    parts = []
+    for column in columns or []:
+        name = column.get("fabric_column_name") or column.get("qlik_column_name") or column.get("name")
+        if not name:
+            continue
+        m_type = _M_TYPE_BY_FABRIC_TYPE.get(column.get("fabric_datatype"), "type text")
+        parts.append(f'{{"{name}", {m_type}}}')
+    return ", ".join(parts)
+
+
+class LoadType:
+    SOURCE = "source"                 # external DB read -> NativeQuery M
+    RESIDENT = "resident"             # loaded from another table in memory
+    TRANSFORMATION = "transformation" # AUTOGENERATE -> DAX or M calculated table
+    INLINE = "inline"                 # INLINE LOAD -> #table(...) M
+    DERIVED = "derived"               # no resolvable source
+
+
+_LOAD_PATTERNS = [
+    (re.compile(r"\bResident\s+\w+", re.IGNORECASE), LoadType.RESIDENT),
+    (re.compile(r"\bINLINE\s*\[", re.IGNORECASE), LoadType.INLINE),
+    (re.compile(r"\bAUTOGENERATE\b", re.IGNORECASE), LoadType.TRANSFORMATION),
+    (re.compile(r"\bSQL\s+SELECT\b", re.IGNORECASE), LoadType.SOURCE),
+    (re.compile(r"\bFROM\s+\[?lib://", re.IGNORECASE), LoadType.SOURCE),
+]
+
+
+def classify_load_type(table: dict) -> str:
+    """
+    Classify how a Qlik table is loaded based on script patterns or metadata.
+    """
+    qlik_query = table.get("qlik_query") or table.get("load_statement") or ""
+    source_type = str(table.get("sourceType") or "").lower()
+
+    if source_type in ("resident", "inline", "transformation"):
+        return {
+            "resident": LoadType.RESIDENT,
+            "inline": LoadType.INLINE,
+            "transformation": LoadType.TRANSFORMATION
+        }[source_type]
+
+    for pattern, ltype in _LOAD_PATTERNS:
+        if pattern.search(qlik_query):
+            return ltype
+
+    return LoadType.SOURCE
+
+
+def make_safe_m_var(name: str) -> str:
+    """
+    Ensure M step variable name starts with a letter or underscore,
+    and contains only alphanumeric characters and underscores.
+    """
+    cleaned = re.sub(r'[^A-Za-z0-9_]', '_', str(name or "")).strip('_')
+    if not cleaned or not re.match(r'^[A-Za-z_]', cleaned):
+        return f"raw_{cleaned}" if cleaned else "raw_table"
+    return cleaned
+
+
+def build_rename_step(prev_step: str, pairs: list) -> str:
+    """
+    Build Table.RenameColumns step for column mapping.
+    pairs: list of (old_col_name, new_col_name) tuples
+    """
+    if not pairs:
+        return prev_step
+    renames = ", ".join(
+        f'{{"{escape_m_string(old)}", "{escape_m_string(new)}"}}'
+        for old, new in pairs
+    )
+    return f"Table.RenameColumns({prev_step}, {{{renames}}})"
+
+
+def build_type_step(prev_step: str, columns: list) -> str:
+    """
+    Build Table.TransformColumnTypes step using schema column types.
+    """
+    transforms = type_transforms_from_columns(columns)
+    if not transforms:
+        return prev_step
+    return f"Table.TransformColumnTypes({prev_step}, {{{transforms}}})"
+
+
+def build_select_columns_step(prev_step: str, column_names: list) -> str:
+    """
+    Build Table.SelectColumns step to keep only the active mapped columns.
+    """
+    if not column_names:
+        return prev_step
+    cols = ", ".join(f'"{escape_m_string(c)}"' for c in column_names)
+    return f"Table.SelectColumns({prev_step}, {{{cols}}})"
+
+
+def build_inline_table_mquery(rows: list, columns: list) -> str:
+    """
+    Build an M `#table(...)` expression for Qlik INLINE loads.
+    """
+    col_names = ", ".join(f'"{escape_m_string(c)}"' for c in columns)
+    row_strings = []
+    for row in rows:
+        vals = ", ".join(f'"{escape_m_string(v)}"' if isinstance(v, str) else str(v) for v in row)
+        row_strings.append(f"{{{vals}}}")
+    all_rows = ", ".join(row_strings)
+    return f'#table({{{col_names}}}, {{{all_rows}}})'
+
+
+def extract_embedded_sql(text: Optional[str]) -> Optional[str]:
+    """Pull a `SELECT ...` statement out of a Qlik load script, if present."""
+    if not text:
+        return None
+    match = _EMBEDDED_SQL.search(text)
+    if not match:
+        return None
+    return match.group(0).strip().rstrip(";").strip()
+
+
+def _default_table_query(source_expr: str, sql: str) -> str:
+    return (
+        f'let\n    Source = {source_expr},\n'
+        f'    Result = Value.NativeQuery(Source, "{sql}", null, [EnableFolding=false])\n'
+        f'in\n    Result'
+    )
+
+
+def _snowflake_table_query(server: str, warehouse: str, db: str, sql: str) -> str:
+    return (
+        f'let\n    Source = Snowflake.Databases("{server}", "{warehouse}"),\n'
+        f'    Db = Source{{[Name="{db}",Kind="Database"]}}[Data],\n'
+        f'    Result = Value.NativeQuery(Db, "{sql}", null, [EnableFolding=false])\n'
+        f'in\n    Result'
+    )
+
+
+def _bigquery_table_query(project: str, sql: str) -> str:
+    proj_clause = f'[BillingProject="{project}"]' if project else ''
+    if project:
+        return (
+            f'let\n    Source = GoogleBigQuery.Database({proj_clause}),\n'
+            f'    Db = Source{{[Name="{project}",Kind="Database"]}}[Data],\n'
+            f'    Result = Value.NativeQuery(Db, "{sql}", null, [EnableFolding=false])\n'
+            f'in\n    Result'
+        )
+    return (
+        f'let\n    Source = GoogleBigQuery.Database({proj_clause}),\n'
+        f'    Result = Value.NativeQuery(Source, "{sql}", null, [EnableFolding=false])\n'
+        f'in\n    Result'
+    )
+
+
+class _ConnectorSpec:
+    """One database driver: how to build its connection-level M expression
+    and its per-table Value.NativeQuery M expression."""
+
+    def __init__(self, key: str, keywords: Tuple[str, ...], score: float,
+                 connection_expr, table_query):
+        self.key = key
+        self.keywords = keywords
+        self.score = score
+        self.connection_expr = connection_expr  # (server, port, db, wh, path, proj) -> (m_func, m_expr)
+        self.table_query = table_query           # (server, port, db, wh, path, sql, proj) -> m_query text
+
+    def matches(self, driver: str, connector: str) -> bool:
+        combined = f"{driver} {connector}".lower()
+        return any(kw in combined for kw in self.keywords)
+
+
+# Order matters: more specific keywords must be checked before generic ones
+_CONNECTOR_SPECS: List[_ConnectorSpec] = [
+    _ConnectorSpec(
+        "redshift", ("redshift", "amazonredshift", "amazon_redshift", "amazon redshift", "qix-redshift"), 0.97,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "AmazonRedshift.Database",
+            f'AmazonRedshift.Database("{server.split(":")[0] if ":" in (server or "") else (server or "")}:{port or 5439}", "{db or "dev"}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _default_table_query(
+            f'AmazonRedshift.Database("{server.split(":")[0] if ":" in (server or "") else (server or "")}:{port or 5439}", "{db or "dev"}")', sql
+        ),
+    ),
+    _ConnectorSpec(
+        "snowflake", ("snowflake", "qix-snowflake"), 0.95,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "Snowflake.Databases",
+            f'Snowflake.Databases("{server}", "{wh or "COMPUTE_WH"}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _snowflake_table_query(server, wh or "COMPUTE_WH", db or "dev", sql),
+    ),
+    _ConnectorSpec(
+        "bigquery", ("bigquery", "google_bigquery", "gbq", "googlebigquery", "google-bigquery", "google bigquery", "qix-gbq"), 0.95,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "GoogleBigQuery.Database",
+            (f'GoogleBigQuery.Database([BillingProject="{proj}"]' + ')') if proj else 'GoogleBigQuery.Database()',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _bigquery_table_query(proj, sql),
+    ),
+    _ConnectorSpec(
+        "postgres", ("postgres", "postgresql", "qix-postgres", "qix-postgresql"), 0.93,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "PostgreSQL.Database",
+            f'PostgreSQL.Database("{server}", "{db or "postgres"}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _default_table_query(
+            f'PostgreSQL.Database("{server}", "{db or "postgres"}")', sql
+        ),
+    ),
+    _ConnectorSpec(
+        "mysql", ("mysql", "mariadb", "qix-mysql"), 0.93,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "MySQL.Database",
+            f'MySQL.Database("{server}", "{db}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _default_table_query(
+            f'MySQL.Database("{server}", "{db}")', sql
+        ),
+    ),
+    _ConnectorSpec(
+        "oracle", ("oracle", "qix-oracle"), 0.90,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "Oracle.Database",
+            f'Oracle.Database("{server}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _default_table_query(
+            f'Oracle.Database("{server}")', sql
+        ),
+    ),
+    _ConnectorSpec(
+        "databricks", ("databricks", "spark", "qix-databricks"), 0.93,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "Databricks.Catalogs",
+            f'Databricks.Catalogs("{server}", "{path or ""}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _default_table_query(
+            f'Databricks.Catalogs("{server}", "{path or ""}")', sql
+        ),
+    ),
+    _ConnectorSpec(
+        "teradata", ("teradata", "qix-teradata"), 0.90,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "Teradata.Database",
+            f'Teradata.Database("{server}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _default_table_query(
+            f'Teradata.Database("{server}")', sql
+        ),
+    ),
+    _ConnectorSpec(
+        "hana", ("hana", "saphana", "sap_hana", "sap hana"), 0.90,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "SapHana.Database",
+            f'SapHana.Database("{server}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _default_table_query(
+            f'SapHana.Database("{server}")', sql
+        ),
+    ),
+    _ConnectorSpec(
+        "synapse", ("synapse", "azure_synapse", "azuresynapse"), 0.95,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "AzureSynapse.Database",
+            f'AzureSynapse.Database("{server}", "{db}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _default_table_query(
+            f'AzureSynapse.Database("{server}", "{db}")', sql
+        ),
+    ),
+    _ConnectorSpec(
+        "sqlserver", ("sqlserver", "mssql", "sql", "azure_sql", "azuresql", "qix-sqlserver"), 0.95,
+        connection_expr=lambda server, port, db, wh, path, proj=None: (
+            "Sql.Database",
+            f'Sql.Database("{server}", "{db}")',
+        ),
+        table_query=lambda server, port, db, wh, path, sql, proj=None: _default_table_query(
+            f'Sql.Database("{server}", "{db}")', sql
+        ),
+    ),
+]
+
+
+class ConnectionMapper:
+    """Translates Qlik connection dictionaries and table metadata into Fabric
+    Power Query M source expressions and table load queries."""
+
+    def __init__(self):
+        self._specs = _CONNECTOR_SPECS
+
+    def _find_spec(self, driver: str, connector: str) -> Optional[_ConnectorSpec]:
+        for spec in self._specs:
+            if spec.matches(driver, connector):
+                return spec
+        return None
+
+    def map_connections(self, raw_connections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        mapped = []
+        for c in raw_connections:
+            if not isinstance(c, dict):
+                continue
+            name = c.get("name") or c.get("lib_name") or "Connection"
+            driver = (c.get("driver") or c.get("connector_type") or "").lower()
+            connector = (c.get("source_connector") or c.get("connector_type") or "").lower()
+            server = c.get("server") or ""
+            
+            # Intelligent default port per connector
+            combined_tag = f"{driver} {connector} {name.lower()}"
+            if "redshift" in combined_tag:
+                default_port = "5439"
+            elif "postgres" in combined_tag:
+                default_port = "5432"
+            elif "mysql" in combined_tag or "mariadb" in combined_tag:
+                default_port = "3306"
+            elif "sql" in combined_tag:
+                default_port = "1433"
+            elif "oracle" in combined_tag:
+                default_port = "1521"
+            elif "hana" in combined_tag:
+                default_port = "30015"
+            elif "teradata" in combined_tag:
+                default_port = "1025"
+            else:
+                default_port = "443"
+
+            port = c.get("port") or default_port
+            db = c.get("database") or c.get("db") or ("dev" if "redshift" in combined_tag else None)
+            path = c.get("path") or ""
+            warehouse = c.get("warehouse") or ("COMPUTE_WH" if "snowflake" in combined_tag else None)
+
+            # Project resolution for BigQuery
+            project = c.get("project")
+            if not project and any(kw in combined_tag for kw in ["bigquery", "gbq"]):
+                bq_match = re.search(r"(?:google_?bigquery_|gbq_)([a-zA-Z0-9_\-]+)", name, re.IGNORECASE) or re.search(r"(?:google_?bigquery_|gbq_)([a-zA-Z0-9_\-]+)", c.get("lib_name", ""), re.IGNORECASE)
+                if bq_match:
+                    project = bq_match.group(1)
+
+            dataset = c.get("dataset")
+
+            m_func, m_expr, score, rationale = self._resolve_fabric_m(driver, connector, server, port, db, path, warehouse, project)
+
+            schema = c.get("schema")
+            if not schema:
+                if any(k in driver or k in connector for k in ["redshift", "postgres", "postgresql"]):
+                    schema = "public"
+                elif "snowflake" in driver or "snowflake" in connector:
+                    schema = "PUBLIC"
+                elif any(k in driver or k in connector for k in ["sqlserver", "sql", "azure_sql"]):
+                    schema = "dbo"
+                elif "databricks" in driver or "databricks" in connector:
+                    schema = "default"
+
+            conn_obj = {
+                "name": name,
+                "connection_id": c.get("connection_id") or c.get("id") or f"conn.{driver or 'unknown'}.{name.lower()}",
+                "lib_name": c.get("lib_name") or name,
+                "driver": c.get("driver") or (driver if driver else None),
+                "source_connector": c.get("source_connector") or (connector if connector else None),
+                "server": c.get("server") or (server if server else None),
+                "port": c.get("port") or (port if port else None),
+                "database": c.get("database") or (db if db else None),
+                "schema": schema,
+                "warehouse": c.get("warehouse") or warehouse,
+                "role": c.get("role"),
+                "project": project,
+                "dataset": dataset,
+                "http_path": c.get("http_path"),
+                "path": path or (name.lower() if "datafiles" in connector else None),
+                "username": c.get("username"),
+                "fabric": {
+                    "m_expression": m_expr,
+                    "m_source_function": m_func,
+                    "gateway_required": True,
+                    "privacy_level": "Organizational"
+                },
+                "confidence": {
+                    "score": score,
+                    "band": "high" if score >= 0.85 else "medium",
+                    "llm_score": score,
+                    "checks": [],
+                    "penalties": [],
+                    "requires_review": score < 0.8,
+                    "rationale": rationale
+                }
+            }
+            mapped.append(conn_obj)
+        return mapped
+
+    def _resolve_fabric_m(self, driver: str, connector: str, server: str, port: str, db: str, path: str, wh: str, project: Optional[str] = None):
+        spec = self._find_spec(driver, connector)
+        if spec:
+            m_func, m_expr = spec.connection_expr(server, port, db, wh, path, project)
+            return m_func, m_expr, spec.score, f"Driver '{driver or connector}' maps to {m_func} by lookup."
+        if "datafiles" in connector or "folder" in driver or "datafiles" in driver or "file" in connector or "file" in driver or "qix-datafiles" in (driver + connector):
+            expr = f'Folder.Files("{path or "datafiles"}")'
+            return "Folder.Files", expr, 0.90, f"The connection references a folder path ('{path or 'datafiles'}') and uses a Qlik datafiles connector. M equivalent is Folder.Files."
+        expr = f'Folder.Files("{path or "datafiles"}")'
+        return "Folder.Files", expr, 0.50, "Unrecognized driver fallback to Folder.Files."
+        if "datafiles" in connector or "folder" in driver or "datafiles" in driver or "file" in connector or "file" in driver:
+            expr = f'Folder.Files("{path or "datafiles"}")'
+            return "Folder.Files", expr, 0.90, f"The connection references a folder path ('{path or 'datafiles'}') and uses a Qlik datafiles connector. M equivalent is Folder.Files."
+        expr = f'Folder.Files("{path or "datafiles"}")'
+        return "Folder.Files", expr, 0.50, "Unrecognized driver fallback to Folder.Files."
+
+    def get_expected_source_function(self, conn_details: Optional[Dict[str, Any]]) -> Optional[str]:
+        """The M source function a table's query is expected to call, given
+        its connection - used by ConfidenceEvaluator to catch a query that
+        silently fell back to a placeholder instead of really loading data."""
+        if not isinstance(conn_details, dict):
+            return None
+        driver = (conn_details.get("driver") or conn_details.get("connector_type") or "").lower()
+        connector = (conn_details.get("source_connector") or conn_details.get("connector_type") or "").lower()
+        spec = self._find_spec(driver, connector)
+        if spec:
+            server = conn_details.get("server") or ""
+            port = conn_details.get("port") or "5439"
+            db = conn_details.get("database") or "dev"
+            warehouse = conn_details.get("warehouse") or "COMPUTE_WH"
+            path = conn_details.get("path") or ""
+            m_func, _ = spec.connection_expr(server, port, db, warehouse, path)
+            return m_func
+        if any(kw in driver or kw in connector for kw in ("datafiles", "folder", "file", "qix-datafiles")):
+            return "Folder.Files"
+        return None
+
+    def build_table_mquery(
+        self,
+        table_name: str,
+        load_type: str = "source",
+        upstream_table: Optional[str] = None,
+        conn_details: Optional[Dict[str, Any]] = None,
+        custom_sql: Optional[str] = None,
+        qlik_query: Optional[str] = None,
+        columns: Optional[List[Dict[str, Any]]] = None,
+        connection: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        conn_details = conn_details or connection
+        # 1. Calendar / Autogenerated Date Table
+        if load_type == "autogenerate" or table_name.lower() == "calendar" or "autogenerate" in (qlik_query or "").lower():
+            date_col = "Date"
+            if columns:
+                first_date = next((c.get("fabric_column_name") or c.get("qlik_column_name") or c.get("name") for c in columns if isinstance(c, dict)), None)
+                if first_date:
+                    date_col = first_date
+            return (
+                'let\n'
+                '    StartDate = #date(2020, 1, 1),\n'
+                '    EndDate = #date(2026, 12, 31),\n'
+                '    NumberOfDays = Duration.Days(EndDate - StartDate) + 1,\n'
+                '    DateList = List.Dates(StartDate, NumberOfDays, #duration(1, 0, 0, 0)),\n'
+                f'    #"Converted to Table" = Table.FromList(DateList, Splitter.SplitByNothing(), {{"{date_col}"}}, null, ExtraValues.Error),\n'
+                f'    #"Changed Type" = Table.TransformColumnTypes(#"Converted to Table", {{{{"{date_col}", type date}}}}),\n'
+                f'    #"Added CalendarYear" = Table.AddColumn(#"Changed Type", "CalendarYear", each Date.Year([{date_col}]), Int64.Type),\n'
+                f'    #"Added CalendarQuarter" = Table.AddColumn(#"Added CalendarYear", "CalendarQuarter", each "Q" & Text.From(Date.QuarterOfYear([{date_col}])), type text),\n'
+                f'    #"Added CalendarMonth" = Table.AddColumn(#"Added CalendarQuarter", "CalendarMonth", each Date.Month([{date_col}]), Int64.Type),\n'
+                f'    #"Added CalendarMonthYear" = Table.AddColumn(#"Added CalendarMonth", "CalendarMonthYear", each Date.ToText([{date_col}], "MMM yyyy"), type text),\n'
+                f'    #"Added CalendarMonthStart" = Table.AddColumn(#"Added CalendarMonthYear", "CalendarMonthStart", each Date.StartOfMonth([{date_col}]), type date),\n'
+                f'    #"Added CalendarWeek" = Table.AddColumn(#"Added CalendarMonthStart", "CalendarWeek", each Date.WeekOfYear([{date_col}]), Int64.Type),\n'
+                f'    #"Added CalendarWeekDay" = Table.AddColumn(#"Added CalendarWeek", "CalendarWeekDay", each Date.DayOfWeekName([{date_col}]), type text),\n'
+                f'    #"Added CalendarDay" = Table.AddColumn(#"Added CalendarWeekDay", "CalendarDay", each Date.Day([{date_col}]), Int64.Type)\n'
+                'in\n'
+                '    #"Added CalendarDay"'
+            )
+
+        # 2. TempCalendar internal table
+        if table_name.lower() == "tempcalendar":
+            return (
+                'let\n'
+                '    Source = #table({"MinDate", "MaxDate"}, {{#date(2020, 1, 1), #date(2026, 12, 31)}})\n'
+                'in\n'
+                '    Source'
+            )
+
+        # 3. Mapping tables
+        if load_type == "mapping" or "mapping load" in (qlik_query or "").lower():
+            target_upstream = upstream_table
+            if not target_upstream and qlik_query:
+                res_match = re.search(r"\bResident\s+([a-zA-Z0-9_#]+)", qlik_query, re.IGNORECASE)
+                if res_match:
+                    target_upstream = res_match.group(1)
+            if target_upstream and target_upstream.lower() != table_name.lower():
+                return (
+                    f'let\n'
+                    f'    Source = {escape_m_identifier(target_upstream)},\n'
+                    f'    #"Distinct Rows" = Table.Distinct(Source)\n'
+                    f'in\n'
+                    f'    #"Distinct Rows"'
+                )
+            col_names = [c.get("fabric_column_name") or c.get("qlik_column_name") or c.get("name") for c in (columns or []) if isinstance(c, dict)]
+            col_names = [c for c in col_names if c]
+            if col_names:
+                headers_str = ", ".join(f'"{c}"' for c in col_names)
+                return f'let\n    Source = #table({{{headers_str}}}, {{}})\nin\n    Source'
+            return f'let\n    Source = #table({{"{table_name}"}}, {{}})\nin\n    Source'
+
+        # 4. Resident table transformation
+        target_upstream = upstream_table
+        if not target_upstream and qlik_query:
+            res_match = re.search(r"\bResident\s+([a-zA-Z0-9_#]+)", qlik_query, re.IGNORECASE)
+            if res_match and res_match.group(1).lower() != table_name.lower():
+                target_upstream = res_match.group(1)
+
+        if not custom_sql and (load_type == "resident" or target_upstream) and target_upstream and target_upstream.lower() != table_name.lower() and not target_upstream.lower().endswith("_raw"):
+            return f"let\n    Source = {escape_m_identifier(target_upstream)}\nin\n    Source"
+
+        conn = conn_details or {}
+        driver = (conn.get("driver") or conn.get("connector_type") or "").lower()
+        connector = (conn.get("source_connector") or conn.get("connector_type") or "").lower()
+        server = conn.get("server") or conn.get("host") or os.getenv("DEFAULT_DB_SERVER", "")
+        port = str(conn.get("port") or ("5439" if "redshift" in (driver + connector) else "5432" if "postgres" in (driver + connector) else "1433" if "sql" in (driver + connector) else "3306" if "mysql" in (driver + connector) else os.getenv("DEFAULT_DB_PORT", "")))
+        db = conn.get("database") or conn.get("db") or os.getenv("DEFAULT_DB_NAME", "")
+        warehouse = conn.get("warehouse") or conn.get("warehouse_name") or os.getenv("DEFAULT_WAREHOUSE", "COMPUTE_WH")
+        if not custom_sql and qlik_query:
+            custom_sql = extract_embedded_sql(qlik_query)
+
+        # Dynamic schema resolution per database connector
+        schema = conn.get("schema")
+        if not schema and qlik_query:
+            schema_match = re.search(r"FROM\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)", qlik_query, re.IGNORECASE)
+            if schema_match:
+                schema = schema_match.group(1)
+
+        if not schema:
+            if any(k in driver or k in connector for k in ["redshift", "postgres", "postgresql"]):
+                schema = "public"
+            elif "snowflake" in driver or "snowflake" in connector:
+                schema = "PUBLIC"
+            elif any(k in driver or k in connector for k in ["sqlserver", "sql", "azure_sql"]):
+                schema = "dbo"
+            elif "databricks" in driver or "databricks" in connector:
+                schema = "default"
+            elif "oracle" in driver or "oracle" in connector:
+                schema = (conn.get("username") or db or "SYSTEM").upper()
+            elif "mysql" in driver or "mysql" in connector:
+                schema = ""
+            else:
+                schema = "public"
+
+        project = conn.get("project")
+        if not project:
+            if custom_sql:
+                bq_sql_match = re.search(r"FROM\s+`?([a-zA-Z0-9_\-]+)`?\.", custom_sql, re.IGNORECASE)
+                if bq_sql_match:
+                    project = bq_sql_match.group(1)
+            if not project and any(kw in (driver + connector) for kw in ["bigquery", "gbq"]):
+                bq_name_match = re.search(r"(?:google_?bigquery_|gbq_)([a-zA-Z0-9_\-]+)", conn.get("name", "") or conn.get("lib_name", ""), re.IGNORECASE)
+                if bq_name_match:
+                    project = bq_name_match.group(1)
+
+        object_name = conn.get("object") or table_name.lower()
+
+        spec = self._find_spec(driver, connector)
+        if not spec and custom_sql:
+            # Infer database spec from SQL dialect if driver was missing
+            if ("`" in custom_sql or "bigquery" in str(conn).lower()) and re.search(r"FROM\s+`?[a-zA-Z0-9_\-]+`?\.`?[a-zA-Z0-9_\-]+`?", custom_sql, re.IGNORECASE):
+                spec = self._find_spec("bigquery", "gbq")
+                if not project:
+                    m = re.search(r"FROM\s+`?([a-zA-Z0-9_\-]+)`?\.", custom_sql)
+                    if m:
+                        project = m.group(1)
+            elif server and ("redshift" in server.lower() or port == "5439"):
+                spec = self._find_spec("redshift", "redshift")
+            elif server and db:
+                spec = self._find_spec("sqlserver", "sql")
+
+        if spec:
+            if custom_sql:
+                clean_sql = custom_sql.strip().rstrip(";")
+                if clean_sql.upper().startswith("SQL "):
+                    clean_sql = clean_sql[4:].strip()
+            elif schema:
+                clean_sql = f"SELECT * FROM {schema}.{object_name}"
+            else:
+                clean_sql = f"SELECT * FROM {object_name}"
+            return spec.table_query(server, port, db, warehouse, conn.get("path") or "", escape_m_string(clean_sql), project)
+
+        # Check for INLINE load in Qlik script
+        inline_match = re.search(r"INLINE\s*\[\s*(.*?)\s*\]", qlik_query or "", re.IGNORECASE | re.DOTALL)
+        if inline_match or load_type == "inline":
+            content = inline_match.group(1).strip() if inline_match else ""
+            lines = [l.strip() for l in content.splitlines() if l.strip()]
+            if lines:
+                headers = [h.strip() for h in lines[0].split(",")]
+                header_expr = "{" + ", ".join(f'"{h}"' for h in headers) + "}"
+                data_rows = []
+                for row_line in lines[1:]:
+                    vals = [v.strip() for v in row_line.split(",")]
+                    data_rows.append("{" + ", ".join(f'"{v}"' for v in vals) + "}")
+                rows_expr = "{\n        " + ",\n        ".join(data_rows) + "\n    }"
+
+                type_transforms = []
+                for h in headers:
+                    h_clean = re.sub(r"[^a-zA-Z0-9_]", "", h.lower())
+                    if any(h_clean.endswith(kw) or h_clean == kw for kw in ["pnl", "price", "quantity", "qty", "volume", "amount", "rate", "percent", "count", "cost", "profit", "loss", "revenue", "sales", "discount", "balance", "fee", "tax"]):
+                        type_transforms.append(f'{{"{h}", type number}}')
+                    elif any(h_clean.endswith(kw) or h_clean == kw for kw in ["date", "tradedate", "orderdate", "dob"]):
+                        type_transforms.append(f'{{"{h}", type datetime}}')
+                    else:
+                        type_transforms.append(f'{{"{h}", type text}}')
+                transform_expr = "{" + ", ".join(type_transforms) + "}"
+
+                has_pnl = "pnl" in (qlik_query or "").lower() and "pnl" not in [h.lower() for h in headers]
+                has_reduction = "reduction" in (qlik_query or "").lower() and "reduction" not in [h.lower() for h in headers]
+                has_result = "traderesult" in (qlik_query or "").lower() and "traderesult" not in [h.lower() for h in headers]
+
+                # Table.FromRows(rows, headers) already assigns real column
+                # names via header_expr - an extra Table.PromoteHeaders on
+                # top of that would take the first *data* row and promote
+                # its values into column names instead, discarding that row
+                # and leaving TransformColumnTypes referencing headers that
+                # no longer exist (an Expression.Error on every INLINE load).
+                steps_lines = [
+                    "let",
+                    f"    Source = Table.FromRows({rows_expr}, {header_expr}),",
+                    f'    #"Changed Type" = Table.TransformColumnTypes(Source, {transform_expr}),',
+                ]
+                last_step = '#"Changed Type"'
+                if has_reduction and "trader" in [h.lower() for h in headers]:
+                    steps_lines.append(f'    #\"Added REDUCTION\" = Table.AddColumn({last_step}, "REDUCTION", each Text.Upper([Trader])),')
+                    last_step = '#"Added REDUCTION"'
+                if has_pnl and "side" in [h.lower() for h in headers] and "exitprice" in [h.lower() for h in headers] and "entryprice" in [h.lower() for h in headers]:
+                    steps_lines.append(f'    #\"Added PnL\" = Table.AddColumn({last_step}, "PnL", each if [Side] = "BUY" then (Number.From([ExitPrice]) - Number.From([EntryPrice])) * Number.From([Quantity]) else (Number.From([EntryPrice]) - Number.From([ExitPrice])) * Number.From([Quantity])),')
+                    last_step = '#"Added PnL"'
+                if has_result:
+                    steps_lines.append(f'    #\"Added TradeResult\" = Table.AddColumn({last_step}, "TradeResult", each if [PnL] > 0 then "Profit" else "Loss"),')
+                    last_step = '#"Added TradeResult"'
+
+                steps_lines[-1] = steps_lines[-1].rstrip(",")
+                steps_lines.append(f"in\n    {last_step}")
+                return "\n".join(steps_lines)
+
+        # Check for REST / JSON API loads. Only when a *real* URL was found -
+        # `is_rest` alone (driver/connector hints) with no discoverable URL
+        # can't build a working M query, so it falls through to the honest
+        # low-confidence placeholder below instead of guessing.
+        url_match = re.search(r"https?://[^\s\"';]+", qlik_query or "") or re.search(r"https?://[^\s\"';]+", conn.get("url") or conn.get("endpoint") or conn.get("server") or "")
+        if url_match:
+            api_url = url_match.group(0)
+            types_str = type_transforms_from_columns(columns)
+            if types_str:
+                return (
+                    f"let\n"
+                    f'    Source = Json.Document(Web.Contents("{api_url}")),\n'
+                    f'    #"Converted to Table" = Table.FromList(Source, Splitter.SplitByNothing(), null, null, ExtraValues.Error),\n'
+                    f'    #"Expanded Column1" = Table.ExpandRecordColumn(#"Converted to Table", "Column1", Record.FieldNames(Source{{0}})),\n'
+                    f'    #"Changed Type" = Table.TransformColumnTypes(#"Expanded Column1", {{{types_str}}})\n'
+                    f"in\n"
+                    f'    #"Changed Type"'
+                )
+            # No resolved columns to type against yet - still real data, just
+            # untyped, rather than guessing a schema that likely doesn't match.
+            return (
+                f"let\n"
+                f'    Source = Json.Document(Web.Contents("{api_url}")),\n'
+                f'    #"Converted to Table" = Table.FromList(Source, Splitter.SplitByNothing(), null, null, ExtraValues.Error),\n'
+                f'    #"Expanded Column1" = Table.ExpandRecordColumn(#"Converted to Table", "Column1", Record.FieldNames(Source{{0}}))\n'
+                f"in\n"
+                f'    #"Expanded Column1"'
+            )
+
+        # Check for file-based loads (Folder / DataFiles / CSV / Excel / QVD)
+        from .connectors.source_resolver import SourceResolver, SourceType
+        resolver = SourceResolver()
+        resolved = resolver.resolve_source(qlik_query or "", conn, table_name)
+
+        if resolved.is_qvd and resolved.requires_review:
+            # QVD without upstream direct DB or Lakehouse mapping: DO NOT pretend it is CSV!
+            return (
+                f'// REVIEW_REQUIRED: {resolved.review_reason}\n'
+                f'let\n'
+                f'    // Action Required: Extract "{resolved.file_name}" to Delta/Parquet Lakehouse or connect directly to upstream DB.\n'
+                f'    Source = #table({{"Status", "Reason"}}, {{"REVIEW_REQUIRED", "{escape_m_string(resolved.review_reason or "")}"}})\n'
+                f'in\n'
+                f'    Source'
+            )
+
+        is_file_conn = any(kw in driver or kw in connector for kw in ("datafiles", "folder", "file", "qix-datafiles"))
+        file_match = _FILE_LOAD.search(qlik_query or "") or _FILE_LOAD_SIMPLE.search(qlik_query or "")
+
+        if is_file_conn or file_match or (conn.get("path") and not server) or resolved.source_type in (SourceType.EXCEL, SourceType.CSV, SourceType.FOLDER):
+            folder = conn.get("path") or conn.get("lib_name") or conn.get("name") or "DataFiles"
+            filename = f"{table_name}.csv"
+            if file_match:
+                if len(file_match.groups()) == 2:
+                    folder = file_match.group(1) or folder
+                    filename = file_match.group(2) or filename
+                elif len(file_match.groups()) == 1:
+                    filename = file_match.group(1) or filename
+            elif resolved.file_name:
+                filename = resolved.file_name
+
+            # Strip lib:// prefix if still present in folder name
+            if folder.lower().startswith("lib://"):
+                folder = folder[6:].split("/")[0]
+
+            types_str = type_transforms_from_columns(columns)
+
+            if filename.lower().endswith((".xlsx", ".xls")) or resolved.source_type == SourceType.EXCEL:
+                last_step = '#"Data"'
+                steps = [
+                    f'let\n',
+                    f'    Source = Folder.Files("{folder}"),\n',
+                    f'    #"Filtered Files" = Table.SelectRows(Source, each ([Name] = "{filename}")),\n',
+                    f'    #"File Content" = #"Filtered Files"{{0}}[Content],\n',
+                    f'    #"Imported Excel" = Excel.Workbook(#"File Content", null, true),\n',
+                    f'    #"Data" = #"Imported Excel"{{0}}[Data]',
+                ]
+                if types_str:
+                    steps.append(f',\n    #"Changed Type" = Table.TransformColumnTypes(#"Data", {{{types_str}}})')
+                    last_step = '#"Changed Type"'
+                steps.append(f'\nin\n    {last_step}')
+                return "".join(steps)
+            elif filename.lower().endswith(".qvd") and not resolved.requires_review:
+                # Handled via Lakehouse/Parquet store
+                lakehouse_tbl = resolved.physical_path
+                return f'let\n    Source = Lakehouse.Tables("{lakehouse_tbl}")\nin\n    Source'
+            else:
+                last_step = '#"Promoted Headers"'
+                steps = [
+                    f'let\n',
+                    f'    Source = Folder.Files("{folder}"),\n',
+                    f'    #"Filtered Files" = Table.SelectRows(Source, each ([Name] = "{filename}")),\n',
+                    f'    #"File Content" = #"Filtered Files"{{0}}[Content],\n',
+                    f'    #"Imported CSV" = Csv.Document(#"File Content", [Delimiter=",", QuoteStyle=QuoteStyle.None]),\n',
+                    f'    #"Promoted Headers" = Table.PromoteHeaders(#"Imported CSV", [PromoteAllScalars=true])',
+                ]
+                if types_str:
+                    steps.append(f',\n    #"Changed Type" = Table.TransformColumnTypes(#"Promoted Headers", {{{types_str}}})')
+                    last_step = '#"Changed Type"'
+                steps.append(f'\nin\n    {last_step}')
+                return "".join(steps)
+
+        # Check for Concatenate / Join / Crosstable operations
+        if qlik_query:
+            if "concatenate" in qlik_query.lower():
+                concat_match = re.search(r"CONCATENATE\s*(?:\(\s*([a-zA-Z0-9_#]+)\s*\))?", qlik_query, re.IGNORECASE)
+                target_base = concat_match.group(1) if concat_match and concat_match.group(1) else upstream_table
+                if target_base and target_base.lower() != table_name.lower():
+                    return f'let\n    Source = Table.Combine({{{SourceResolver.escape_identifier(target_base)}, {SourceResolver.escape_identifier(table_name + "_Raw")}}})\nin\n    Source'
+            elif "left join" in qlik_query.lower() or "join" in qlik_query.lower():
+                join_match = re.search(r"(?:LEFT\s+)?JOIN\s*(?:\(\s*([a-zA-Z0-9_#]+)\s*\))?", qlik_query, re.IGNORECASE)
+                target_base = join_match.group(1) if join_match and join_match.group(1) else upstream_table
+                if target_base and target_base.lower() != table_name.lower():
+                    return f'let\n    Source = Table.NestedJoin({SourceResolver.escape_identifier(target_base)}, {{"ID"}}, {SourceResolver.escape_identifier(table_name + "_Raw")}, {{"ID"}}, "JoinedTable", JoinKind.LeftOuter)\nin\n    Source'
+            elif "crosstable" in qlik_query.lower():
+                return f'let\n    Source = {SourceResolver.escape_identifier(upstream_table or table_name + "_Raw")},\n    #"Unpivoted Other Columns" = Table.UnpivotOtherColumns(Source, {{"ID"}}, "Attribute", "Value")\nin\n    #"Unpivoted Other Columns"'
+
+        return f"let\n    Source = {SourceResolver.escape_identifier(table_name)}\nin\n    Source"
+
+    def parse_mquery_to_steps(self, mquery: str) -> List[Dict[str, Any]]:
+        steps = []
+        if mquery.startswith("let\n") or mquery.startswith("let\r\n") or mquery.startswith("let "):
+            body = mquery[3:].strip()
+            parts = re.split(r"\s+in\s+", body, maxsplit=1)
+            if len(parts) == 2:
+                let_block = parts[0].strip()
+                in_block = parts[1].strip()
+
+                # Split by commas that are at depth 0 (not inside quotes, braces, or parentheses)
+                statements = []
+                current = []
+                depth_brace = 0
+                depth_paren = 0
+                depth_bracket = 0
+                in_quote = False
+
+                for char in let_block:
+                    if char == '"':
+                        in_quote = not in_quote
+                        current.append(char)
+                    elif in_quote:
+                        current.append(char)
+                    elif char == '{':
+                        depth_brace += 1
+                        current.append(char)
+                    elif char == '}':
+                        depth_brace = max(0, depth_brace - 1)
+                        current.append(char)
+                    elif char == '(':
+                        depth_paren += 1
+                        current.append(char)
+                    elif char == ')':
+                        depth_paren = max(0, depth_paren - 1)
+                        current.append(char)
+                    elif char == '[':
+                        depth_bracket += 1
+                        current.append(char)
+                    elif char == ']':
+                        depth_bracket = max(0, depth_bracket - 1)
+                        current.append(char)
+                    elif char == ',' and depth_brace == 0 and depth_paren == 0 and depth_bracket == 0:
+                        statements.append("".join(current).strip())
+                        current = []
+                    else:
+                        current.append(char)
+                if current:
+                    statements.append("".join(current).strip())
+
+                for i, stmt in enumerate(statements):
+                    stmt = stmt.strip()
+                    if not stmt:
+                        continue
+                    if len(statements) == 1:
+                        steps.append({"step": len(steps)+1, "content": f"let {stmt} in {in_block}"})
+                    elif i == 0:
+                        steps.append({"step": len(steps)+1, "content": f"let {stmt}"})
+                    elif i == len(statements) - 1:
+                        steps.append({"step": len(steps)+1, "content": f"{stmt} in {in_block}"})
+                    else:
+                        steps.append({"step": len(steps)+1, "content": stmt})
+                if steps:
+                    return steps
+        return [{"step": 1, "content": mquery}]
+

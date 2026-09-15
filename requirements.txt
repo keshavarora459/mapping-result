@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic
+aiohttp
+openai
+groq
+azure-core
+autogen
+python-dotenv
+cachetools
+PyJWT[crypto]
+azure-identity
+pytest
+pytest-asyncio
