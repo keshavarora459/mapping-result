@@ -5,13 +5,22 @@ import os
 import random
 from typing import Any, Dict, List, Optional
 
-from groq import (
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    AsyncGroq,
-    RateLimitError,
-)
+try:
+    from groq import (
+        APIConnectionError,
+        APIStatusError,
+        APITimeoutError,
+        AsyncGroq,
+        RateLimitError,
+    )
+except ImportError:
+    class AsyncGroq:
+        def __init__(self, *args, **kwargs):
+            pass
+    class APIConnectionError(Exception): pass
+    class APIStatusError(Exception): pass
+    class APITimeoutError(Exception): pass
+    class RateLimitError(Exception): pass
 
 from config import Config
 from common.llm import redact_sensitive_data

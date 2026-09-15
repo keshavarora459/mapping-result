@@ -1,6 +1,11 @@
 import logging
 from typing import Dict, List, Union, Any, Optional
-from autogen import ConversableAgent
+try:
+    from autogen import ConversableAgent
+except ImportError:
+    class ConversableAgent:
+        def __init__(self, *args, **kwargs):
+            pass
 from logging_config import AgentLoggerAdapter
 from src.converters.llm_client import GroqLLMClient
 from services.dax_converter import DAXConverter

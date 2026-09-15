@@ -424,8 +424,6 @@ class ConnectionMapper:
                     "score": score,
                     "band": "high" if score >= 0.85 else "medium",
                     "llm_score": score,
-                    "checks": [],
-                    "penalties": [],
                     "requires_review": score < 0.8,
                     "rationale": rationale
                 }
@@ -470,7 +468,40 @@ class ConnectionMapper:
             return "Folder.Files"
         return None
 
+    def _post_process_mquery(
+        self,
+        baseline_m: str,
+        qlik_query: Optional[str],
+        registry: Optional[Any] = None,
+    ) -> str:
+        if not qlik_query or "applymap" not in qlik_query.lower():
+            return baseline_m
+        if registry is None:
+            from .mapping_table_registry import MappingTableRegistry
+            registry = MappingTableRegistry()
+            registry.discover_from_script(qlik_query)
+        final_m, _ = registry.translate_applymap_to_m(baseline_m, qlik_query)
+        return final_m
+
     def build_table_mquery(
+        self,
+        table_name: str,
+        load_type: str = "source",
+        upstream_table: Optional[str] = None,
+        conn_details: Optional[Dict[str, Any]] = None,
+        custom_sql: Optional[str] = None,
+        qlik_query: Optional[str] = None,
+        columns: Optional[List[Dict[str, Any]]] = None,
+        connection: Optional[Dict[str, Any]] = None,
+        registry: Optional[Any] = None,
+    ) -> str:
+        res = self._build_raw_table_mquery(
+            table_name, load_type, upstream_table, conn_details,
+            custom_sql, qlik_query, columns, connection
+        )
+        return self._post_process_mquery(res, qlik_query, registry=registry)
+
+    def _build_raw_table_mquery(
         self,
         table_name: str,
         load_type: str = "source",
@@ -650,12 +681,6 @@ class ConnectionMapper:
                 has_reduction = "reduction" in (qlik_query or "").lower() and "reduction" not in [h.lower() for h in headers]
                 has_result = "traderesult" in (qlik_query or "").lower() and "traderesult" not in [h.lower() for h in headers]
 
-                # Table.FromRows(rows, headers) already assigns real column
-                # names via header_expr - an extra Table.PromoteHeaders on
-                # top of that would take the first *data* row and promote
-                # its values into column names instead, discarding that row
-                # and leaving TransformColumnTypes referencing headers that
-                # no longer exist (an Expression.Error on every INLINE load).
                 steps_lines = [
                     "let",
                     f"    Source = Table.FromRows({rows_expr}, {header_expr}),",
@@ -676,10 +701,6 @@ class ConnectionMapper:
                 steps_lines.append(f"in\n    {last_step}")
                 return "\n".join(steps_lines)
 
-        # Check for REST / JSON API loads. Only when a *real* URL was found -
-        # `is_rest` alone (driver/connector hints) with no discoverable URL
-        # can't build a working M query, so it falls through to the honest
-        # low-confidence placeholder below instead of guessing.
         url_match = re.search(r"https?://[^\s\"';]+", qlik_query or "") or re.search(r"https?://[^\s\"';]+", conn.get("url") or conn.get("endpoint") or conn.get("server") or "")
         if url_match:
             api_url = url_match.group(0)
@@ -694,8 +715,6 @@ class ConnectionMapper:
                     f"in\n"
                     f'    #"Changed Type"'
                 )
-            # No resolved columns to type against yet - still real data, just
-            # untyped, rather than guessing a schema that likely doesn't match.
             return (
                 f"let\n"
                 f'    Source = Json.Document(Web.Contents("{api_url}")),\n'
@@ -705,13 +724,11 @@ class ConnectionMapper:
                 f'    #"Expanded Column1"'
             )
 
-        # Check for file-based loads (Folder / DataFiles / CSV / Excel / QVD)
         from .connectors.source_resolver import SourceResolver, SourceType
         resolver = SourceResolver()
         resolved = resolver.resolve_source(qlik_query or "", conn, table_name)
 
         if resolved.is_qvd and resolved.requires_review:
-            # QVD without upstream direct DB or Lakehouse mapping: DO NOT pretend it is CSV!
             return (
                 f'// REVIEW_REQUIRED: {resolved.review_reason}\n'
                 f'let\n'
@@ -736,7 +753,6 @@ class ConnectionMapper:
             elif resolved.file_name:
                 filename = resolved.file_name
 
-            # Strip lib:// prefix if still present in folder name
             if folder.lower().startswith("lib://"):
                 folder = folder[6:].split("/")[0]
 
@@ -758,7 +774,6 @@ class ConnectionMapper:
                 steps.append(f'\nin\n    {last_step}')
                 return "".join(steps)
             elif filename.lower().endswith(".qvd") and not resolved.requires_review:
-                # Handled via Lakehouse/Parquet store
                 lakehouse_tbl = resolved.physical_path
                 return f'let\n    Source = Lakehouse.Tables("{lakehouse_tbl}")\nin\n    Source'
             else:
@@ -777,7 +792,6 @@ class ConnectionMapper:
                 steps.append(f'\nin\n    {last_step}')
                 return "".join(steps)
 
-        # Check for Concatenate / Join / Crosstable operations
         if qlik_query:
             if "concatenate" in qlik_query.lower():
                 concat_match = re.search(r"CONCATENATE\s*(?:\(\s*([a-zA-Z0-9_#]+)\s*\))?", qlik_query, re.IGNORECASE)

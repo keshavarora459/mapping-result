@@ -76,8 +76,6 @@ class DummyConfidence:
             "percentage": f"{score_100}%",
             "band": "high" if score >= 0.85 else ("medium" if score >= 0.60 else "low"),
             "llm_score": score,
-            "checks": checks,
-            "penalties": [],
             "requires_review": score < 0.85 or not fabric.get("supported", True) or bool(unbound),
             "rationale": kwargs.get("rationale", ""),
         }

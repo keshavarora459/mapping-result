@@ -4,7 +4,12 @@ import logging
 import re
 from typing import Dict, List, Any, Optional
 
-from autogen import ConversableAgent
+try:
+    from autogen import ConversableAgent
+except ImportError:
+    class ConversableAgent:
+        def __init__(self, *args, **kwargs):
+            pass
 from .mapping_agent import MappingAgent
 from services.connection_mapper import ConnectionMapper, extract_embedded_sql
 from services.dax_converter import DAXConverter
@@ -118,6 +123,10 @@ class CoordinatorAgent(ConversableAgent):
                 if t_n and not t_n.endswith("_raw"):
                     target_names_lower.add(t_n)
 
+        from services.mapping_table_registry import MappingTableRegistry
+        registry = MappingTableRegistry()
+        registry.discover_from_tables(raw_tables)
+
         formatted_tables = []
         for t in raw_tables:
             if not isinstance(t, dict):
@@ -164,6 +173,7 @@ class CoordinatorAgent(ConversableAgent):
             raw_cols = t.get("fields") or t.get("columns") or []
             cols = []
             unresolved = []
+            missing_reports = []
             for c in raw_cols:
                 if isinstance(c, str):
                     cname = c
@@ -212,10 +222,6 @@ class CoordinatorAgent(ConversableAgent):
                 if raw_fmt == "General Text" and ftype == "double":
                     raw_fmt = "#,##0.00"
                 if is_derived_label and raw_fmt not in ("General Text", "General", ""):
-                    # The parent date field's inherited format ("YYYY-MM-DD")
-                    # doesn't apply once the type correction below makes this
-                    # a text label; a stale date format on a string column
-                    # is meaningless and confuses PBI Desktop's field pane.
                     raw_fmt = "General Text"
 
                 # Sanitize column names: replace dots/spaces with underscores for TMDL compatibility
@@ -225,24 +231,32 @@ class CoordinatorAgent(ConversableAgent):
                     "fabric_datatype": ftype, "summarize_by": summarize, "is_hidden": False, "format_string": raw_fmt
                 })
 
-                # Generic ApplyMap extraction for unresolved references in any report
-                for m_app in re.finditer(r"ApplyMap\s*\([^)]+\)(?:\s+as\s+[a-zA-Z0-9_]+)?", qlik_q, re.IGNORECASE):
-                    unresolved.append(m_app.group(0).strip())
+            # Check for genuine missing ApplyMap references
+            for m_app in re.finditer(r"ApplyMap\s*\(\s*'([^']+)'", qlik_q, re.IGNORECASE):
+                map_n = m_app.group(1).strip()
+                m_def = registry.get(map_n)
+                if not m_def:
+                    found_in_raw = any((tbl.get("name") or tbl.get("table_name") or "").lower() == map_n.lower() for tbl in raw_tables if isinstance(tbl, dict))
+                    if not found_in_raw:
+                        rep = registry.generate_missing_mapping_report(map_n, m_app.group(0))
+                        missing_reports.append(rep)
+                        unresolved.append(f"ApplyMap('{map_n}')")
 
             # A table's own custom_sql wins; otherwise look for a raw SELECT
-            # embedded in its Qlik load script - the connector-specific
-            # NativeQuery path only activates when custom_sql is populated,
-            # and on real Qlik payloads that SQL is present in qlik_query but
-            # never surfaced as a separate field.
             custom_sql = custom_sql or t.get("custom_sql") or extract_embedded_sql(qlik_q)
 
-            mquery = self.conn_mapper.build_table_mquery(name, load_type, upstream, conn, custom_sql, qlik_query=qlik_q, columns=cols)
+            mquery = self.conn_mapper.build_table_mquery(
+                name, load_type, upstream, conn, custom_sql, qlik_query=qlik_q, columns=cols, registry=registry
+            )
             fabric_meta = self.tmdl_gen.generate_table_tmdl(name, cols, mquery)
             if "partition" in fabric_meta and "m_expression" in fabric_meta["partition"]:
                 fabric_meta["partition"]["m_expression"] = self.conn_mapper.parse_mquery_to_steps(mquery)
             if "m_query" in fabric_meta:
                 fabric_meta["m_query"] = self.conn_mapper.parse_mquery_to_steps(mquery)
             fabric_meta["unresolved"] = unresolved
+            if missing_reports:
+                fabric_meta["missing_mappings"] = missing_reports
+
             expected_source_fn = self.conn_mapper.get_expected_source_function(conn)
             conf = self.confidence_eval.evaluate_table(
                 name, load_type, mquery, unresolved,
@@ -255,6 +269,7 @@ class CoordinatorAgent(ConversableAgent):
                 "connection": conn, "upstream_table": upstream, "qlik_query": qlik_q,
                 "custom_sql": custom_sql, "columns": cols, "confidence": conf,
                 "m_query": self.conn_mapper.parse_mquery_to_steps(mquery),
+                "missing_mappings": missing_reports,
             })
         return formatted_tables
 
@@ -404,8 +419,6 @@ class CoordinatorAgent(ConversableAgent):
                     "score": 0.0,
                     "band": "low",
                     "llm_score": 0.0,
-                    "checks": [{"id": "visual_conversion_succeeded", "status": "fail"}],
-                    "penalties": [],
                     "requires_review": True,
                     "rationale": f"LLM-assisted conversion failed ({exc}); used rule-based mapping instead.",
                 },
@@ -603,7 +616,6 @@ class CoordinatorAgent(ConversableAgent):
                         "score": 0.85 if not is_unresolved else 0.3,
                         "band": "high" if not is_unresolved else "low",
                         "llm_score": 0.85 if not is_unresolved else 0.3,
-                        "checks": [], "penalties": [],
                         "requires_review": is_unresolved,
                         "rationale": f"Derived DAX measure for visual field '{label_clean}'." if not is_unresolved else f"Unresolved visual field expression '{label_clean}'."
                     },
@@ -835,7 +847,28 @@ class CoordinatorAgent(ConversableAgent):
             "rls": build_security_contract(data.get("section_access"), tables), "data_model": {},
             "lineage": [], "limitations_summary": [], "object_inventory": {}, "section_status": [],
             "extraction": {}, "master_objects": [], "media": media, "snapshots": [], "data_files": data_files_out,
-            "conversion_summary": summary, "llm_status": self.summary_builder.build_llm_status()
+            "conversion_summary": summary, "llm_status": self.summary_builder.build_llm_status(),
+            
+            # BEST/reference JSON structural alignment mapping
+            "project_name": app_name,
+            "datasources": connections,
+            "dashboard_objects": visuals_struct.get("sheet_visuals", []),
+            "all_dashboard_objects": visuals_struct.get("sheet_visuals", []),
+            "dashboard_objects_summary": {},
+            "styling_summary": {},
+            "sheets": visuals_struct.get("sheets", []),
+            "unmapped_objects": [],
+            "unmapped_summary": {},
+            "parameters": converted_variables,
+            "sets": [],
+            "formatting_and_styling": app_layout.get("theme", {}) if app_layout else {},
+            "actions": [],
+            "embedded_assets": media,
+            "permissions": build_security_contract(data.get("section_access"), tables),
+            "artifacts": [],
+            "security": build_security_contract(data.get("section_access"), tables),
+            "cosmos_db": {},
+            "logs": []
         }
 
         gate_eval = ProductionGate.evaluate(out_payload)

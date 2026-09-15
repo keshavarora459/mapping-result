@@ -129,7 +129,7 @@ class DashboardObjectConverter(BaseConverter):
 
     def item_name(self, item: Any) -> str:
         if isinstance(item, dict):
-            return str(item.get("title") or item.get("visual_name") or "DashboardObject")
+            return str(item.get("title") or item.get("visual_name") or item.get("name") or item.get("qlik_name") or "DashboardObject")
         return "DashboardObject"
 
     def source_block(self, item: Any) -> Dict[str, Any]:
@@ -629,7 +629,7 @@ class DashboardObjectConverter(BaseConverter):
         )
 
         return ConvertedItem(
-            name=self.item_name(item),
+            name=title,
             source=self.source_block(item),
             fabric=fabric,
             confidence=confidence,

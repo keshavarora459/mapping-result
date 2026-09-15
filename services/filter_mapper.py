@@ -101,8 +101,6 @@ class FilterMapper:
                 "percentage": f"{int(round(score * 100))}%",
                 "band": "high" if score >= 0.85 else ("medium" if score >= 0.60 else "low"),
                 "llm_score": score,
-                "checks": checks,
-                "penalties": [] if resolved else [f"Unresolved field '{field}'"],
                 "requires_review": not resolved,
                 "rationale": rationale,
             },

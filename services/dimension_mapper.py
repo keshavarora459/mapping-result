@@ -163,8 +163,6 @@ class DimensionMapper:
             "score_out_of_100": score_100,
             "percentage": f"{score_100}%",
             "band": band,
-            "checks": checks,
-            "penalties": [],
             "requires_review": score < 0.70 or bool(dimension.get("is_calculated")),
             "rationale": (
                 "Drill-down group mapped to a Power BI hierarchy."

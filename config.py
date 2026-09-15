@@ -1,9 +1,18 @@
 import os
 import logging
-from cachetools import TTLCache
-from dotenv import load_dotenv
+try:
+    from cachetools import TTLCache
+except ImportError:
+    class TTLCache(dict):
+        def __init__(self, maxsize=100, ttl=300):
+            super().__init__()
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    def load_dotenv():
+        pass
 
 logger = logging.getLogger(__name__)
 

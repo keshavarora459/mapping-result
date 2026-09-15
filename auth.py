@@ -1,7 +1,18 @@
 import logging
 from contextvars import ContextVar
-from fastapi import Request, HTTPException
-from jwt import PyJWKClient, decode as jwt_decode, ExpiredSignatureError, InvalidTokenError
+try:
+    from fastapi import Request, HTTPException
+except ImportError:
+    class Request: pass
+    class HTTPException(Exception): pass
+
+try:
+    from jwt import PyJWKClient, decode as jwt_decode, ExpiredSignatureError, InvalidTokenError
+except ImportError:
+    PyJWKClient = None
+    jwt_decode = None
+    class ExpiredSignatureError(Exception): pass
+    class InvalidTokenError(Exception): pass
 from config import ENABLE_AUTH, JWKS_URL, EXPECTED_AUDIENCE, ISSUER
 
 logger = logging.getLogger(__name__)

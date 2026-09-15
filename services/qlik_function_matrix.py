@@ -70,11 +70,50 @@ class QlikFunctionMatrix:
         else:
             return "string", "type text"
 
+    @staticmethod
+    def _transform_qlik_date_time_hash(func_name: str, m_target_func: str, text: str) -> str:
+        """Replace Date#(expr, fmt) or Time#(expr, fmt) with m_target_func(expr) preserving nested parens."""
+        pattern = re.compile(rf"\b{re.escape(func_name)}\s*\(", re.IGNORECASE)
+        while True:
+            match = pattern.search(text)
+            if not match:
+                break
+            start_idx = match.start()
+            arg_start = match.end()
+            depth = 1
+            curr = arg_start
+            comma_idx = -1
+            while curr < len(text) and depth > 0:
+                ch = text[curr]
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif ch == ',' and depth == 1:
+                    if comma_idx == -1:
+                        comma_idx = curr
+                curr += 1
+            
+            if depth != 0:
+                break
+            
+            arg_end = curr
+            if comma_idx != -1:
+                first_arg = text[arg_start:comma_idx].strip()
+            else:
+                first_arg = text[arg_start:arg_end].strip()
+            
+            replacement = f"{m_target_func}({first_arg})"
+            text = text[:start_idx] + replacement + text[arg_end + 1:]
+        return text
+
     # -------------------------------------------------------------
     # 3. Date / Time / String Function M Translations
     # -------------------------------------------------------------
-    @staticmethod
-    def translate_qlik_expression_to_m(expr: str) -> str:
+    @classmethod
+    def translate_qlik_expression_to_m(cls, expr: str) -> str:
         """Convert scalar Qlik date/string expressions to Power Query M."""
         if not expr:
             return ""
@@ -82,20 +121,10 @@ class QlikFunctionMatrix:
         res = expr.strip()
 
         # Date#([col], 'YYYY-MM-DD') -> Date.FromText([col])
-        res = re.sub(
-            r"Date#\s*\(\s*(\[[^\]]+\]|[A-Za-z0-9_]+)\s*(?:,\s*'[^']*')?\s*\)",
-            r"Date.FromText(\1)",
-            res,
-            flags=re.IGNORECASE,
-        )
+        res = cls._transform_qlik_date_time_hash("Date#", "Date.FromText", res)
 
         # Time#([col], 'hh:mm TT') -> Time.FromText([col])
-        res = re.sub(
-            r"Time#\s*\(\s*(\[[^\]]+\]|[A-Za-z0-9_]+)\s*(?:,\s*'[^']*')?\s*\)",
-            r"Time.FromText(\1)",
-            res,
-            flags=re.IGNORECASE,
-        )
+        res = cls._transform_qlik_date_time_hash("Time#", "Time.FromText", res)
 
         # AddMonths([col], n) -> Date.AddMonths([col], n)
         res = re.sub(
@@ -121,11 +150,33 @@ class QlikFunctionMatrix:
             flags=re.IGNORECASE,
         )
 
-        # Lower([col]) -> Text.Lower([col]), Upper([col]) -> Text.Upper([col])
+        # SubField([col], delimiter, index) -> Text.Split([col], delimiter){index - 1}
+        sub_match = re.search(r"SubField\s*\(\s*([^,]+)\s*,\s*('[^']+'|\"[^\"]+\")\s*,\s*(\d+)\s*\)", res, re.IGNORECASE)
+        if sub_match:
+            col_part = sub_match.group(1).strip()
+            delim = sub_match.group(2)
+            idx = int(sub_match.group(3)) - 1
+            res = f"Text.Split({col_part}, {delim}){{{idx}}}"
+
+        # Lower([col]) -> Text.Lower([col]), Upper([col]) -> Text.Upper([col]), Trim, Len
         res = re.sub(r"\bLower\s*\(", r"Text.Lower(", res, flags=re.IGNORECASE)
         res = re.sub(r"\bUpper\s*\(", r"Text.Upper(", res, flags=re.IGNORECASE)
         res = re.sub(r"\bTrim\s*\(", r"Text.Trim(", res, flags=re.IGNORECASE)
         res = re.sub(r"\bLen\s*\(", r"Text.Length(", res, flags=re.IGNORECASE)
+
+        # Ensure bare column references inside function args like Text.Lower(col) become Text.Lower([col])
+        def _ensure_col_brackets(m):
+            fn_name = m.group(1)
+            arg = m.group(2).strip()
+            if arg and not arg.startswith("[") and not arg.startswith('"') and not arg.startswith("'") and not re.match(r"^\d", arg):
+                arg = f"[{arg}]"
+            return f"{fn_name}({arg})"
+
+        res = re.sub(r"\b(Text\.Lower|Text\.Upper|Text\.Trim|Text\.Length|Date\.FromText|Time\.FromText)\s*\(\s*([A-Za-z0-9_#]+)\s*\)", _ensure_col_brackets, res)
+
+        # If bare column identifier without brackets
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_#]*$", res):
+            res = f"[{res}]"
 
         # If(cond, then, else) -> if cond then val1 else val2
         if_match = re.match(r"^\s*If\s*\((.*)\)\s*$", res, re.IGNORECASE | re.DOTALL)

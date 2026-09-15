@@ -1,5 +1,8 @@
 import logging
-import aiohttp
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
 from config import Config, HEADERS
 from auth import request_token_ctx
 from common.llm import redact_sensitive_data
