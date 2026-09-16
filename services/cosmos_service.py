@@ -34,33 +34,101 @@ def _get_base_apis() -> list:
     return apis
 
 
+import asyncio
+
+def _enrich_parsing_result(pr: Dict[str, Any], envelope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Ensure the parsing_result dict carries summary and _meta from its envelope or _meta block."""
+    if not isinstance(pr, dict):
+        return pr
+
+    env = envelope if isinstance(envelope, dict) else {}
+
+    # 1. Preserve summary
+    if "summary" not in pr or not pr["summary"]:
+        summary = env.get("summary") or (pr.get("_meta", {}).get("summary") if isinstance(pr.get("_meta"), dict) else None) or (env.get("_meta", {}).get("summary") if isinstance(env.get("_meta"), dict) else None)
+        if summary and isinstance(summary, dict):
+            pr["summary"] = summary
+
+    # 2. Preserve _meta
+    if "_meta" not in pr or not pr["_meta"]:
+        meta = env.get("_meta")
+        if meta and isinstance(meta, dict):
+            pr["_meta"] = meta
+
+    return pr
+
+
 async def fetch_parsing_from_cosmos(app_id: str, run_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Fetch parsed metadata directly from MongoDB API via run_id or app_id."""
+    """Fetch parsed metadata directly from MongoDB first, then HTTP API fallback."""
+
+    # ── 1. Direct MongoDB (fastest & most reliable) ─────
+    mongo_uri = os.getenv("MONGO_URI") or os.getenv("COSMOS_CONNECTION_STRING") or os.getenv("MONGODB_URI")
+    if mongo_uri:
+        try:
+            from pymongo import MongoClient
+            db_name = os.getenv("MONGO_DB_NAME", "QT2F")
+            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
+            db = client[db_name]
+            coll = db["parsing"]
+
+            query = {}
+            if run_id and app_id:
+                query = {"$or": [{"run_id": run_id}, {"app_id": app_id}]}
+            elif run_id:
+                query = {"run_id": run_id}
+            elif app_id:
+                query = {"app_id": app_id}
+
+            doc = coll.find_one(query, sort=[("_id", -1)])
+            if doc:
+                if "_id" in doc:
+                    doc["_id"] = str(doc["_id"])
+                logger.info(f"Successfully fetched parsing directly from MongoDB for run_id={run_id}, app_id={app_id}")
+                pr = doc.get("parsing_result")
+                if isinstance(pr, dict) and pr:
+                    return _enrich_parsing_result(pr, doc)
+                return _enrich_parsing_result(doc, doc)
+        except Exception as me:
+            logger.warning(f"Direct MongoDB fetch failed: {me}, trying HTTP API fallback...")
+
+    # ── 2. HTTP API fallback ─────
     token = request_token_ctx.get()
     headers = {'Authorization': f"Bearer {token}"} if token else {}
+    timeout = aiohttp.ClientTimeout(total=30)
 
     urls_to_try = []
     for base in _get_base_apis():
         if run_id:
             urls_to_try.append(f"{base}/parsing/by-run/{run_id}")
-            urls_to_try.append(f"{base}/parsing/{run_id}")
         if app_id:
             urls_to_try.append(f"{base}/parsing/by-app/{app_id}")
-            urls_to_try.append(f"{base}/parsing/{app_id}")
 
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         for url in urls_to_try:
             try:
-                async with session.get(url, timeout=15) as response:
+                async with session.get(url) as response:
                     if response.status == 200:
                         data = await response.json()
                         if isinstance(data, list) and data:
-                            parsing_result = data[0].get("parsing_result")
-                            if isinstance(parsing_result, dict) and parsing_result:
-                                return parsing_result
-                            return data[0]
+                            target = None
+                            for item in data:
+                                if isinstance(item, dict):
+                                    if (run_id and item.get("run_id") == run_id) or (app_id and item.get("app_id") == app_id):
+                                        target = item
+                                        break
+                            if not target and data:
+                                target = data[0] if isinstance(data[0], dict) else None
+
+                            if target:
+                                pr = target.get("parsing_result")
+                                if isinstance(pr, dict) and pr:
+                                    return _enrich_parsing_result(pr, target)
+                                return _enrich_parsing_result(target, target)
                         elif isinstance(data, dict) and not _is_not_found_body(data):
-                            return data.get("parsing_result") or data
+                            pr = data.get("parsing_result")
+                            if isinstance(pr, dict) and pr:
+                                return _enrich_parsing_result(pr, data)
+                            return _enrich_parsing_result(data, data)
             except Exception as e:
                 logger.warning(f"Failed to fetch parsing from {url}: {e}")
 
@@ -68,30 +136,71 @@ async def fetch_parsing_from_cosmos(app_id: str, run_id: Optional[str] = None) -
 
 
 async def fetch_mapping_from_cosmos(app_id: str, run_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Fetch mapped result from MongoDB API via run_id or app_id."""
+    """Fetch mapped result via direct MongoDB first, then HTTP API fallback."""
+
+    # ── 1. Direct MongoDB (fastest) ─────
+    mongo_uri = os.getenv("MONGO_URI") or os.getenv("COSMOS_CONNECTION_STRING") or os.getenv("MONGODB_URI")
+    if mongo_uri:
+        try:
+            from pymongo import MongoClient
+            db_name = os.getenv("MONGO_DB_NAME", "QT2F")
+            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
+            db = client[db_name]
+            coll = db["mapping"]
+
+            query = {}
+            if run_id and app_id:
+                query = {"$or": [{"run_id": run_id}, {"app_id": app_id}]}
+            elif run_id:
+                query = {"run_id": run_id}
+            elif app_id:
+                query = {"app_id": app_id}
+
+            doc = coll.find_one(query, sort=[("_id", -1)])
+            if doc:
+                if "_id" in doc:
+                    doc["_id"] = str(doc["_id"])
+                logger.info(f"Successfully fetched mapping directly from MongoDB for run_id={run_id}, app_id={app_id}")
+                mr = doc.get("mapping_result")
+                if isinstance(mr, dict) and mr:
+                    return mr
+                return doc
+        except Exception as me:
+            logger.warning(f"Direct MongoDB fetch for mapping failed: {me}, trying HTTP API fallback...")
+
+    # ── 2. HTTP API fallback ─────
     token = request_token_ctx.get()
     headers = {'Authorization': f"Bearer {token}"} if token else {}
+    timeout = aiohttp.ClientTimeout(total=30)
 
     urls_to_try = []
     for base in _get_base_apis():
         if run_id:
             urls_to_try.append(f"{base}/mapping/by-run/{run_id}")
-            urls_to_try.append(f"{base}/mapping/{run_id}")
         if app_id:
             urls_to_try.append(f"{base}/mapping/by-app/{app_id}")
-            urls_to_try.append(f"{base}/mapping/{app_id}")
 
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         for url in urls_to_try:
             try:
-                async with session.get(url, timeout=15) as response:
+                async with session.get(url) as response:
                     if response.status == 200:
                         data = await response.json()
                         if isinstance(data, list) and data:
-                            mapping_result = data[0].get("mapping_result")
-                            if isinstance(mapping_result, dict) and mapping_result:
-                                return mapping_result
-                            return data[0]
+                            target = None
+                            for item in data:
+                                if isinstance(item, dict):
+                                    if (run_id and item.get("run_id") == run_id) or (app_id and item.get("app_id") == app_id):
+                                        target = item
+                                        break
+                            if not target and data:
+                                target = data[0] if isinstance(data[0], dict) else None
+
+                            if target:
+                                mapping_result = target.get("mapping_result")
+                                if isinstance(mapping_result, dict) and mapping_result:
+                                    return mapping_result
+                                return target
                         elif isinstance(data, dict) and not _is_not_found_body(data):
                             return data.get("mapping_result") or data
             except Exception as e:

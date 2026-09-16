@@ -9,7 +9,7 @@ import pytest
 from agents import CoordinatorAgent
 from services.dimension_mapper import DimensionMapper
 
-# The 41 keys of Contract 2.0, in the order the reference response uses.
+# The 42 keys of Contract 2.0, in the order the reference response uses.
 CONTRACT_KEYS = [
     "status", "message", "error_message", "contract_version", "workbook_metadata",
     "app_layout", "app_metadata", "connections", "tables", "relationships",
@@ -18,9 +18,10 @@ CONTRACT_KEYS = [
     "bookmarks", "themes", "extensions", "master_item_tags", "hypercube_samples",
     "script", "data_load_editor", "fields", "rls", "data_model", "lineage",
     "limitations_summary", "object_inventory", "section_status", "extraction",
-    "master_objects", "media", "snapshots", "data_files", "conversion_summary",
+    "master_objects", "media", "snapshots", "data_files", "summary", "conversion_summary",
     "llm_status", "migration_status", "production_gate",
 ]
+
 
 QLIK_MEASURE = {
     "qInfo": {"qId": "m1"},
@@ -210,3 +211,32 @@ def test_dax_does_not_qualify_text_inside_literals():
     mapper.index_columns([{"name": "T", "columns": [{"qlik_column_name": "city"}]}])
     # "city" inside the literal must stay literal text.
     assert mapper.to_dax("'city' & city", "T") == "\"city\" & 'T'[city]"
+
+
+def test_summary_extracted_from_parsing_metadata():
+    payload = dict(PAYLOAD)
+    payload["_meta"] = {
+        "summary": {
+            "tables": 5,
+            "dimensions": 3,
+            "measures": 10,
+            "relationships": 4,
+            "sheets": 14,
+            "visualizations": 68,
+            "empty_keys": 0,
+            "populated_keys": 8239,
+            "view": "compact"
+        }
+    }
+    out = asyncio.run(CoordinatorAgent().process_data(payload, False, "app-1"))
+    assert "summary" in out
+    assert out["summary"]["tables"] == 5
+    assert out["summary"]["dimensions"] == 3
+    assert out["summary"]["measures"] == 10
+    assert out["summary"]["relationships"] == 4
+    assert out["summary"]["sheets"] == 14
+    assert out["summary"]["visualizations"] == 68
+    assert out["summary"]["empty_keys"] == 0
+    assert out["summary"]["populated_keys"] == 8239
+    assert out["summary"]["view"] == "compact"
+
