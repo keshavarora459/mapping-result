@@ -832,7 +832,7 @@ class CoordinatorAgent(ConversableAgent):
 
         out_payload = {
             "status": "success", "message": "Mapping completed successfully", "error_message": None,
-            "contract_version": "2.0", "workbook_metadata": workbook_meta, "app_layout": app_layout,
+            "contract_version": "2.0", "summary": parsing_summary, "workbook_metadata": workbook_meta, "app_layout": app_layout,
             "app_metadata": app_meta, "connections": connections, "tables": tables,
             "relationships": relationships, "measures": measures, "dimensions": dimensions,
             "calculated_columns": data.get("calculated_columns", []), "custom_sql": data.get("custom_sql", []),
@@ -849,7 +849,6 @@ class CoordinatorAgent(ConversableAgent):
             "rls": build_security_contract(data.get("section_access"), tables), "data_model": {},
             "lineage": [], "limitations_summary": [], "object_inventory": {}, "section_status": [],
             "extraction": {}, "master_objects": [], "media": media, "snapshots": [], "data_files": data_files_out,
-            "summary": parsing_summary,
             "conversion_summary": summary, "llm_status": self.summary_builder.build_llm_status()
         }
 

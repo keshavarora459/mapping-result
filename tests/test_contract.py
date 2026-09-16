@@ -11,14 +11,14 @@ from services.dimension_mapper import DimensionMapper
 
 # The 42 keys of Contract 2.0, in the order the reference response uses.
 CONTRACT_KEYS = [
-    "status", "message", "error_message", "contract_version", "workbook_metadata",
+    "status", "message", "error_message", "contract_version", "summary", "workbook_metadata",
     "app_layout", "app_metadata", "connections", "tables", "relationships",
     "measures", "dimensions", "calculated_columns", "custom_sql", "visuals",
     "filters", "limitations", "variables", "section_access", "stories",
     "bookmarks", "themes", "extensions", "master_item_tags", "hypercube_samples",
     "script", "data_load_editor", "fields", "rls", "data_model", "lineage",
     "limitations_summary", "object_inventory", "section_status", "extraction",
-    "master_objects", "media", "snapshots", "data_files", "summary", "conversion_summary",
+    "master_objects", "media", "snapshots", "data_files", "conversion_summary",
     "llm_status", "migration_status", "production_gate",
 ]
 
