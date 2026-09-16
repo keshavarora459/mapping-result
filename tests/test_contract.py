@@ -9,10 +9,10 @@ import pytest
 from agents import CoordinatorAgent
 from services.dimension_mapper import DimensionMapper
 
-# The 42 keys of Contract 2.0, in the order the reference response uses.
+# The 43 keys of Contract 2.0, in the order the reference response uses.
 CONTRACT_KEYS = [
     "status", "message", "error_message", "contract_version", "summary", "workbook_metadata",
-    "app_layout", "app_metadata", "connections", "tables", "relationships",
+    "app_layout", "app_metadata", "datasources", "connections", "tables", "relationships",
     "measures", "dimensions", "calculated_columns", "custom_sql", "visuals",
     "filters", "limitations", "variables", "section_access", "stories",
     "bookmarks", "themes", "extensions", "master_item_tags", "hypercube_samples",
@@ -21,6 +21,7 @@ CONTRACT_KEYS = [
     "master_objects", "media", "snapshots", "data_files", "conversion_summary",
     "llm_status", "migration_status", "production_gate",
 ]
+
 
 
 QLIK_MEASURE = {
@@ -239,4 +240,42 @@ def test_summary_extracted_from_parsing_metadata():
     assert out["summary"]["empty_keys"] == 0
     assert out["summary"]["populated_keys"] == 8239
     assert out["summary"]["view"] == "compact"
+
+
+def test_datasources_structured_format():
+    payload = dict(PAYLOAD)
+    payload["datasources"] = [
+        {
+            "datasource_id": "ds_1",
+            "name": "FleetVisionRedshift",
+            "connector_type": "redshift",
+            "server": "fleetvision-wg.881226714470.ap-southeast-2.redshift-serverless.amazonaws.com",
+            "database": "dev",
+            "schema": "PUBLIC",
+            "username": "VECTORLAB",
+            "warehouse": "COMPUTE_WH"
+        }
+    ]
+    out = asyncio.run(CoordinatorAgent().process_data(payload, False, "app-1"))
+    assert "datasources" in out
+    assert len(out["datasources"]) == 1
+    ds = out["datasources"][0]
+    assert ds["id"] == "conn.redshift.fleetvisionredshift"
+    assert ds["name"] == "FleetVisionRedshift"
+    assert ds["inline"] is True
+    assert ds["mode"] == "extract"
+    assert ds["connection_type"] == "redshift"
+    assert len(ds["connections"]) == 1
+    conn = ds["connections"][0]
+    assert conn["server"] == "fleetvision-wg.881226714470.ap-southeast-2.redshift-serverless.amazonaws.com"
+    assert conn["database"] == "dev"
+    assert conn["schema"] == "PUBLIC"
+    assert conn["username"] == "VECTORLAB"
+    assert len(conn["tables"]) == 3
+    assert conn["tables"][0] == "dev.PUBLIC.Loads"
+    assert len(ds["embedded_credentials"]) == 1
+    cred = ds["embedded_credentials"][0]
+    assert cred["username"] == "VECTORLAB"
+    assert cred["authentication"] == "Username Password"
+
 

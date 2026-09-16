@@ -14,9 +14,17 @@ try:
         RateLimitError,
     )
 except ImportError:
+    class _MockChatCompletions:
+        async def create(self, *args, **kwargs):
+            raise RuntimeError("The 'groq' package is not installed. Please install it using 'pip install groq'.")
+
+    class _MockChat:
+        def __init__(self):
+            self.completions = _MockChatCompletions()
+
     class AsyncGroq:
         def __init__(self, *args, **kwargs):
-            pass
+            self.chat = _MockChat()
     class APIConnectionError(Exception): pass
     class APIStatusError(Exception): pass
     class APITimeoutError(Exception): pass

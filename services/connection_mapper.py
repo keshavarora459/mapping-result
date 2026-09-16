@@ -431,6 +431,81 @@ class ConnectionMapper:
             mapped.append(conn_obj)
         return mapped
 
+    @staticmethod
+    def format_datasources(
+        raw_datasources: List[Dict[str, Any]],
+        tables: List[Dict[str, Any]],
+        connection_details: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """Format datasources into structured connector specifications with nested connections and embedded credentials."""
+        if raw_datasources and isinstance(raw_datasources, list) and isinstance(raw_datasources[0], dict) and "connections" in raw_datasources[0]:
+            return raw_datasources
+
+        ds_list = list(raw_datasources) if raw_datasources else ([connection_details] if connection_details else [])
+        if not ds_list:
+            return []
+
+        table_names = [t.get("name") or t.get("table_name") for t in tables if isinstance(t, dict) and (t.get("name") or t.get("table_name"))]
+
+        formatted = []
+        for ds in ds_list:
+            if not isinstance(ds, dict):
+                continue
+            name = ds.get("name") or "DataSource"
+            conn_type = (ds.get("connector_type") or ds.get("driver") or ds.get("source_connector") or "redshift").lower()
+            if "datafile" in conn_type and not ds.get("server"):
+                continue
+            if "redshift" in conn_type:
+                conn_type = "redshift"
+            elif "snowflake" in conn_type:
+                conn_type = "snowflake"
+            elif "gbq" in conn_type or "bigquery" in conn_type:
+                conn_type = "bigquery"
+            elif "postgres" in conn_type:
+                conn_type = "postgres"
+            elif "sql" in conn_type:
+                conn_type = "sqlserver"
+
+            server = ds.get("server") or (connection_details.get("server") if isinstance(connection_details, dict) else "")
+            database = ds.get("database") or (connection_details.get("database") if isinstance(connection_details, dict) else "dev")
+            schema = ds.get("schema") or "PUBLIC"
+            username = ds.get("username") or "VECTORLAB"
+            warehouse = ds.get("warehouse") or "COMPUTE_WH"
+
+            formatted_tables = [f"{database}.{schema}.{tname}" if "." not in tname else tname for tname in table_names]
+            clean_name = name.lower().replace(" ", "")
+            ds_id = ds.get("id") or f"conn.{conn_type}.{clean_name}"
+
+            formatted.append({
+                "id": ds_id,
+                "name": name,
+                "inline": True,
+                "mode": "extract",
+                "connection_type": conn_type,
+                "connections": [
+                    {
+                        "friendly_name": server or name,
+                        "type": conn_type,
+                        "server": server,
+                        "database": database,
+                        "schema": schema,
+                        "username": username,
+                        "warehouse": warehouse,
+                        "tables": formatted_tables
+                    }
+                ],
+                "embedded_credentials": [
+                    {
+                        "connection_type": conn_type,
+                        "username": username,
+                        "authentication": "Username Password",
+                        "embed_password": False
+                    }
+                ]
+            })
+        return formatted
+
+
     def _resolve_fabric_m(self, driver: str, connector: str, server: str, port: str, db: str, path: str, wh: str, project: Optional[str] = None):
         spec = self._find_spec(driver, connector)
         if spec:

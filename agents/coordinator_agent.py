@@ -829,11 +829,16 @@ class CoordinatorAgent(ConversableAgent):
         )
 
         parsing_summary = self.summary_builder.extract_parsing_summary(data)
+        datasources_formatted = self.conn_mapper.format_datasources(
+            raw_datasources=data.get("datasources") or [],
+            tables=data.get("tables") or [],
+            connection_details=data.get("connection_details")
+        )
 
         out_payload = {
             "status": "success", "message": "Mapping completed successfully", "error_message": None,
             "contract_version": "2.0", "summary": parsing_summary, "workbook_metadata": workbook_meta, "app_layout": app_layout,
-            "app_metadata": app_meta, "connections": connections, "tables": tables,
+            "app_metadata": app_meta, "datasources": datasources_formatted, "connections": connections, "tables": tables,
             "relationships": relationships, "measures": measures, "dimensions": dimensions,
             "calculated_columns": data.get("calculated_columns", []), "custom_sql": data.get("custom_sql", []),
             "visuals": visuals_struct, "filters": filters,
