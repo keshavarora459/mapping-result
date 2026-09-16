@@ -703,7 +703,6 @@ class CoordinatorAgent(ConversableAgent):
         )
         for v, converted_item in zip(raw_visuals, converted_items):
             v_item = {
-                "name": converted_item.name,
                 "qlik_source": converted_item.source,
                 "fabric": converted_item.fabric,
                 "confidence": converted_item.confidence

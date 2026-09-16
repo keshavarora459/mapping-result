@@ -98,7 +98,6 @@ async def post_mapping_data(payload: MappingRequest, request: Request):
                         for v in raw_visuals:
                             converted_item = await dashboard_converter.convert_one(v, ctx)
                             v_item = {
-                                "name": converted_item.name,
                                 "qlik_source": converted_item.source,
                                 "fabric": converted_item.fabric,
                                 "confidence": converted_item.confidence

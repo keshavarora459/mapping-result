@@ -216,10 +216,49 @@ async def save_mapping_to_cosmos(
     run_id: str, 
     mapping_result: Dict[str, Any]
 ) -> Dict[str, str]:
-    """Save converted mapping result back to MongoDB / Cosmos DB."""
+    """Save converted mapping result back to MongoDB directly and via HTTP API."""
     if not app_id and not run_id:
         return {"status": "skipped", "message": "No app_id or run_id provided"}
-    
+
+    saved_directly = False
+
+    # ── 1. Direct MongoDB save (fastest & most reliable) ─────
+    mongo_uri = os.getenv("MONGO_URI") or os.getenv("COSMOS_CONNECTION_STRING") or os.getenv("MONGODB_URI")
+    if mongo_uri:
+        try:
+            from pymongo import MongoClient
+            import datetime
+            db_name = os.getenv("MONGO_DB_NAME", "QT2F")
+            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
+            db = client[db_name]
+            coll = db["mapping"]
+
+            doc_to_save = {
+                "app_id": app_id or "",
+                "space_id": space_id or "",
+                "app_name": app_name or "",
+                "run_id": run_id or "",
+                "mapping_result": mapping_result,
+                "updated_at": datetime.datetime.utcnow().isoformat()
+            }
+
+            query = {}
+            if run_id:
+                query = {"run_id": run_id}
+            elif app_id:
+                query = {"app_id": app_id}
+
+            if query:
+                coll.update_one(query, {"$set": doc_to_save}, upsert=True)
+            else:
+                coll.insert_one(doc_to_save)
+
+            logger.info(f"Successfully saved mapping directly to MongoDB collection 'mapping' for run_id={run_id}, app_id={app_id}")
+            saved_directly = True
+        except Exception as me:
+            logger.warning(f"Direct MongoDB save failed: {me}")
+
+    # ── 2. HTTP API fallback / sync ─────
     last_error = None
     for base in _get_base_apis():
         try:
@@ -238,9 +277,14 @@ async def save_mapping_to_cosmos(
                 
             async with aiohttp.ClientSession(headers=headers) as session:
                 async with session.post(url, json=payload, timeout=30) as response:
-                    response.raise_for_status()
-                    return {"status": "success", "message": "Mapping result saved"}
+                    if response.status in (200, 201):
+                        return {"status": "success", "message": "Mapping result saved"}
         except Exception as e:
             last_error = e
-            logger.error(f"Error saving mapping to {base}: {e}")
+            logger.warning(f"HTTP save mapping to {base} warning: {e}")
+
+    if saved_directly:
+        return {"status": "success", "message": "Mapping result saved directly to MongoDB"}
+
     return {"status": "error", "message": str(last_error)}
+
