@@ -33,10 +33,20 @@ async def _run_and_drain(payload):
     return result
 
 
+import pytest
+import config
+
+@pytest.fixture(autouse=True)
+def disable_live_llm(monkeypatch):
+    monkeypatch.setattr(config.Config, "USE_LLM_MQUERY", False)
+    monkeypatch.setattr(config.Config, "USE_LLM_MEASURES", False)
+    monkeypatch.setattr(config.Config, "USE_LLM_VISUALS", False)
+
+
 def test_more_than_six_detailed_agent_actions_are_logged():
     calls = []
 
-    async def fake_log(action, app_id=None, run_id=None, details=None):
+    async def fake_log(action, app_id=None, run_id=None, details=None, **kwargs):
         calls.append((action, details))
 
     with patch("agents.coordinator_agent.log_action_to_api", new=fake_log):
@@ -50,7 +60,7 @@ def test_more_than_six_detailed_agent_actions_are_logged():
 
 
 def test_logging_never_blocks_the_request_even_if_the_api_is_slow():
-    async def slow_log(action, app_id=None, run_id=None, details=None):
+    async def slow_log(action, app_id=None, run_id=None, details=None, **kwargs):
         await asyncio.sleep(5)  # far longer than a real mapping run should take
 
     start = time.monotonic()

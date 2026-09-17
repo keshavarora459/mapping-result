@@ -1,17 +1,14 @@
 """LLM-assisted repair of generated Power Query M.
 
 services/connection_mapper.py builds each table's M expression from a
-per-connector template. That is the right default - a connector signature is
-a fact, not a judgement - but a template cannot express the parts of a Qlik
-LOAD that genuinely require interpretation: preceding loads, resident chains,
-CROSSTABLE unpivots, ApplyMap lookups and inline tables.
+per-connector template and deterministic parsing.
 
-This stage reviews the generated M against the original Qlik statement.
-
-`USE_LLM_MQUERY` defaults to **false**. A wrong DAX measure produces a wrong
-number in one visual; a wrong M query means the table does not load at all
-and the whole report is empty. This should stay off until the golden-file
-regression harness exists.
+Optimization Workflow:
+1. Validate baseline M-query deterministically.
+2. If already valid, keep deterministic result and SKIP LLM completely.
+3. Only if baseline is invalid/placeholder (e.g. resident chains, complex CROSSTABLE),
+   invoke compact LLM request with minimal context and caching.
+4. On LLM rate-limit / failure, preserve deterministic/regex fallback.
 """
 
 import asyncio
@@ -33,6 +30,9 @@ SOURCE_MARKERS = (
     ".Database(", ".Databases(", ".Files(", ".Catalogs(", ".Contents(",
     "NativeQuery(", "Table.FromRows(", "Json.Document(", "#table(",
     "Csv.Document(", "Excel.Workbook(", "Parquet.Document(",
+    "Table.SelectRows(", "Table.AddColumn(", "Table.Group(",
+    "Table.TransformColumns(", "Table.Combine(", "Table.NestedJoin(",
+    "Table.SelectColumns(", "Table.Distinct(", "List.Dates(",
 )
 
 CODE_FENCE = re.compile(r"```[a-zA-Z]*\s*(.*?)```", re.DOTALL)
@@ -50,11 +50,7 @@ def strip_fences(text: str) -> str:
 
 
 def _balanced(expr: str) -> bool:
-    """Parens/brackets/braces balanced outside string literals.
-
-    M strings are double-quoted with `""` as the escape, so a quote is a
-    toggle unless it is immediately doubled.
-    """
+    """Parens/brackets/braces balanced outside string literals."""
     depth = 0
     in_string = False
     index = 0
@@ -98,7 +94,19 @@ def validate_mquery(
         problems.append(
             "contains an unexpanded Qlik dollar-sign expansion, which is not valid M"
         )
-    if not any(marker in text for marker in SOURCE_MARKERS):
+    has_known_upstream = False
+    if known_queries:
+        for kq in known_queries:
+            if kq and kq.lower() != table_name.lower() and (
+                f"Source = {kq}" in text
+                or f'Source = #"{kq}"' in text
+                or f"Source = {kq}_Raw" in text
+                or f'Source = #"{kq}_Raw"' in text
+            ):
+                has_known_upstream = True
+                break
+
+    if not any(marker in text for marker in SOURCE_MARKERS) and not has_known_upstream:
         problems.append("no real connector call - looks like an unresolved placeholder")
 
     # Qlik syntax that should have been translated away.
@@ -128,9 +136,8 @@ class MQueryConverter:
     @property
     def llm_client(self):
         if self._llm_client is None:
-            from src.converters.llm_client import GroqLLMClient
-
-            self._llm_client = GroqLLMClient()
+            from src.converters.llm_client import get_llm_client
+            self._llm_client = get_llm_client()
         return self._llm_client
 
     @staticmethod
@@ -139,8 +146,8 @@ class MQueryConverter:
         if not isinstance(connection, dict):
             return "(no connection metadata supplied)"
         keep = (
-            "name", "lib_name", "connection_id", "type", "provider", "driver",
-            "server", "host", "database", "schema", "path", "url", "catalog",
+            "name", "type", "provider", "driver", "server", "host",
+            "database", "schema", "path", "url",
         )
         lines = [f"- {k}: {connection[k]}" for k in keep if connection.get(k)]
         return "\n".join(lines) or "(no connection metadata supplied)"
@@ -162,7 +169,7 @@ class MQueryConverter:
                 connection_context=self._connection_context(table),
                 upstream_tables=known_queries,
             )
-            answer = await self.llm_client.generate_text(system, user)
+            answer = await self.llm_client.generate_text(system, user, stage=STAGE)
             usage.record_success(STAGE)
         except Exception as exc:  # noqa: BLE001
             usage.record_failure(STAGE, str(exc))
@@ -170,11 +177,14 @@ class MQueryConverter:
                 "LLM M-query review failed for '%s' (%s); keeping generated query.",
                 name, exc,
             )
+            table["conversion_method"] = "regex_fallback"
+            table["llm_status"] = "rate_limited" if "rate" in str(exc).lower() else "failed"
             return table
 
         candidate = strip_fences(answer)
         if not candidate:
             usage.record_rejected(STAGE, "model returned nothing usable")
+            table["conversion_method"] = "regex_fallback"
             return table
 
         ok, problems = validate_mquery(candidate, name, known_queries)
@@ -184,9 +194,11 @@ class MQueryConverter:
                 "Rejected LLM M-query for '%s' (%s); kept generated query.",
                 name, "; ".join(problems[:3]),
             )
+            table["conversion_method"] = "regex_fallback"
             return table
 
         if candidate.strip() == str(baseline).strip():
+            table["conversion_method"] = "deterministic_rule"
             return table
 
         usage.record_accepted(STAGE)
@@ -195,16 +207,19 @@ class MQueryConverter:
         from services.connection_mapper import ConnectionMapper
         table["m_query"] = ConnectionMapper().parse_mquery_to_steps(candidate)
         table["conversion_method"] = "llm_refined"
+        table["llm_status"] = "success"
         return table
 
     async def refine_all(self, tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not Config.USE_LLM_MQUERY or not tables:
+        if not tables:
             return tables
 
+        usage = llm_usage.current()
         known = [
             str(t.get("name") or t.get("table_name") or "")
             for t in tables if isinstance(t, dict)
         ]
+
         targets = []
         for table in tables:
             if not isinstance(table, dict):
@@ -220,15 +235,32 @@ class MQueryConverter:
                 baseline = "\n".join(steps)
             else:
                 baseline = str(raw_m or "")
-            if baseline and str(baseline).strip():
+
+            t_name = str(table.get("name") or table.get("table_name") or "")
+            if not baseline or not baseline.strip():
+                continue
+
+            # Deterministic first: if baseline M-query is already structurally valid, skip LLM!
+            is_valid, _ = validate_mquery(baseline, t_name, known)
+            if is_valid or not Config.USE_LLM_MQUERY:
+                usage.record_deterministic(STAGE)
+                table["conversion_method"] = "deterministic_rule"
+                table["llm_status"] = "not_needed"
+            else:
                 targets.append((table, str(baseline)))
 
-        if not targets:
+        if not targets or not Config.USE_LLM_MQUERY:
             return tables
 
-        logger.info("Reviewing %d M-query expression(s) with the LLM", len(targets))
-        await asyncio.gather(
-            *(self.refine_one(table, baseline, known) for table, baseline in targets),
-            return_exceptions=True,
-        )
+        logger.info("Reviewing %d / %d unvalidated M-query expression(s) with LLM", len(targets), len(tables))
+
+        # Process in batches of Config.LLM_MAX_BATCH_SIZE with controlled concurrency
+        batch_size = max(1, Config.LLM_MAX_BATCH_SIZE)
+        for i in range(0, len(targets), batch_size):
+            batch = targets[i : i + batch_size]
+            await asyncio.gather(
+                *(self.refine_one(table, baseline, known) for table, baseline in batch),
+                return_exceptions=True,
+            )
+
         return tables

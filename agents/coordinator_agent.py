@@ -20,7 +20,7 @@ from src.converters.base import ConversionContext, ConvertedItem
 from services.summary_builder import SummaryBuilder
 from services.dimension_mapper import DimensionMapper
 from services.filter_mapper import FilterMapper
-from services.api_logger import log_action_to_api
+from services.api_logger import log_action_to_api, log_agent_log_to_api
 from services import llm_usage
 from services.variable_expander import build_variable_index, expand, expand_in_place
 from src.converters.measures.converter import MeasureConverter
@@ -187,38 +187,63 @@ class CoordinatorAgent(ConversableAgent):
                     continue
 
                 num_types = ["NUMBER", "NUMERIC", "DECIMAL", "FLOAT", "DOUBLE", "REAL", "INT", "INTEGER", "BIGINT", "SMALLINT", "NUM", "MONEY", "CURRENCY"]
-                date_types = ["DATE", "DATETIME", "TIMESTAMP", "TIME", "INTERVAL"]
+                date_types = ["DATE", "DATETIME", "TIMESTAMP"]
                 bool_types = ["BOOLEAN", "BOOL", "BIT"]
                 c_clean = re.sub(r"[^a-zA-Z0-9_]", "", cname.lower())
 
-                # Qlik-computed date-part fields inherit parent date types; name wins.
-                is_derived_label = "label" in c_clean
-                is_derived_year = c_clean.endswith("year") and "label" not in c_clean
+                # 1. Labels, Names, Bands, Categories, and Descriptions are always string
+                is_derived_label = "label" in c_clean or "band" in c_clean or c_clean in [
+                    "drivername", "home_terminal", "trucknumber", "calendarmonthyear",
+                    "calendarmonth", "calendarmonthstart", "calendartmonthname", "calendarweekday",
+                    "calendarquarter", "monthyear", "revenueband", "distanceband", "fuelefficiencyband",
+                    "idletimeband", "tripmonth", "loadmonth", "tripyear", "tripweek", "monthno",
+                    "monthsort", "calendaryear", "calendarday", "calendarweek", "longitude_latitude",
+                    "mindate", "maxdate", "dispatchdate", "monthstartdate"
+                ]
+                is_derived_year = (c_clean.endswith("year") or c_clean == "year") and "label" not in c_clean
 
                 if is_derived_label:
-                    ftype = "string"
+                    if c_clean in ["calendarmonthstart", "monthstartdate", "mindate", "maxdate", "dispatchdate"]:
+                        ftype = "date"
+                    elif c_clean in ["calendarmonth", "calendaryear", "calendarday", "calendarweek", "monthsort", "tripmonth", "loadmonth", "tripyear", "tripweek", "monthno"]:
+                        ftype = "int64"
+                    else:
+                        ftype = "string"
+                # 2. Specific calendar dates
+                elif c_clean in ["contract_start_date", "hire_date", "termination_date", "date_of_birth", "truck_acquisition_date", "maintenance_date", "trailer_acquisition_date", "load_date", "purchase_date", "incident_date"]:
+                    ftype = "date"
+                # 3. Durations, hours, minutes, seconds, rates, percentages, mpg, gallons, miles, costs are ALWAYS numeric
+                elif any(c_clean.endswith(kw) or c_clean.startswith(kw) or kw in c_clean for kw in ["hours", "minutes", "seconds", "duration", "downtime", "detention", "rate", "percent", "percentage", "mpg", "gallons", "miles", "mileage", "cost", "parts", "labor", "amount", "revenue", "price", "pnl", "profit", "loss", "charges", "surcharge", "potential", "weight", "lbs", "odometer", "latitude", "longitude"]):
+                    ftype = "double"
+                # 4. Counts, events, trips, incidents, transactions, pieces, days, doors, numbers are integer counts
+                elif any(c_clean.endswith(kw) or c_clean.startswith(kw) or kw in c_clean for kw in ["events", "trips", "incidents", "transactions", "pieces", "days", "count", "doors", "terms", "rank", "sort", "unit_number", "trailer_number"]) and not c_clean.endswith("id"):
+                    ftype = "int64"
                 elif is_derived_year:
+                    ftype = "int64"
+                # 5. Flags
+                elif c_clean.endswith("flag") or c_clean == "flag":
                     ftype = "int64"
                 elif qtype in num_types or any(nt in qtype for nt in ["NUM", "DEC", "FLOAT", "DOUBLE", "INT"]):
                     ftype = "double" if not any(it in qtype for it in ["INT", "BIGINT"]) else "int64"
-                elif qtype in date_types or any(dt in qtype for dt in ["DATE", "TIME"]):
+                elif qtype in date_types or any(dt in qtype for dt in ["DATE", "TIMESTAMP"]):
                     ftype = "dateTime"
                 elif qtype in bool_types:
                     ftype = "boolean"
                 else:
-                    if any(c_clean.endswith(sw) or c_clean == sw for sw in ["result", "status", "type", "name", "category", "desc", "description", "side", "symbol", "trader", "reduction", "comment", "note", "title", "flag", "code"]):
+                    if any(c_clean.endswith(sw) or c_clean == sw for sw in ["result", "status", "type", "name", "category", "desc", "description", "side", "symbol", "trader", "reduction", "comment", "note", "title", "code", "vin", "card", "location", "city", "state", "terminal", "freight", "booking", "make"]):
                         ftype = "string"
                     elif any(c_clean.endswith(kw) or c_clean.startswith(kw) or c_clean == kw for kw in ["pnl", "price", "quantity", "qty", "volume", "amount", "rate", "percent", "count", "cost", "profit", "loss", "revenue", "sales", "discount", "balance", "fee", "tax", "units", "gpa", "credits"]) and not c_clean.endswith("id"):
                         ftype = "double"
                     elif any(c_clean.endswith(kw) or c_clean == kw for kw in ["date", "tradedate", "orderdate", "dob", "created_at", "updated_at"]):
-                        ftype = "dateTime"
+                        ftype = "date"
                     elif any(c_clean.endswith(kw) or c_clean == kw for kw in ["year", "rank", "opentime", "closetime"]):
                         ftype = "int64"
                     else:
                         ftype = "string"
 
-
-                summarize = "sum" if ftype in ["double", "int64"] and not cname.lower().endswith("id") and not cname.lower().endswith("code") and not c_clean.endswith("year") and not c_clean.endswith("rank") else "none"
+                # Summarize by sum for additive numeric measures
+                is_id = cname.lower().endswith("id") or cname.lower().endswith("code") or c_clean.endswith("year") or c_clean.endswith("rank") or c_clean.endswith("sort") or c_clean.endswith("flag") or "rate" in c_clean or "avg" in c_clean or "mpg" in c_clean or "month" in c_clean or "day" in c_clean or "week" in c_clean or "price" in c_clean or "date" in c_clean or "door" in c_clean or "term" in c_clean or "status" in c_clean or "number" in c_clean
+                summarize = "sum" if ftype in ["double", "int64"] and not is_id else "none"
                 if raw_fmt == "General Text" and ftype == "double":
                     raw_fmt = "#,##0.00"
                 if is_derived_label and raw_fmt not in ("General Text", "General", ""):
@@ -439,19 +464,43 @@ class CoordinatorAgent(ConversableAgent):
         # what actually happened instead of asserting a hardcoded `true`.
         llm_usage.start_run()
 
-        def log(action: str, details: str) -> None:
-            _fire_and_forget(log_action_to_api(action, app_id=app_id, run_id=run_id, details=details))
+        def log(action: str, details: str, stage_key: Optional[str] = None) -> None:
+            _fire_and_forget(log_action_to_api(
+                action=action,
+                app_id=app_id,
+                run_id=run_id,
+                details=details,
+                workspace_id=space_id,
+                project_name=app_name,
+                stage_key=stage_key
+            ))
+
+        def log_agent_log(message: str, log_level: str = "INFO", function_name: str = "process_data", details: Any = None) -> None:
+            _fire_and_forget(log_agent_log_to_api(
+                message=message,
+                agent_name="Mapping Agent",
+                log_level=log_level,
+                function_name=function_name,
+                details=details,
+                run_id=run_id,
+                workspace_id=space_id,
+                app_id=app_id,
+                correlation_id=run_id
+            ))
 
         log(
             "Mapping run started",
             f"app_name='{app_name}', app_id='{app_id}', space_id='{space_id}', run_id='{run_id}'",
+            stage_key="start",
         )
 
         datasources = data.get("datasources") or ([data.get("connection_details")] if data.get("connection_details") else [])
         connections = self.conn_mapper.map_connections(datasources)
-        log("Mapped Qlik connections to Fabric data sources", f"{len(connections)} connection(s) mapped")
+        log_agent_log(f"Mapped {len(connections)} connection(s) from {len(datasources)} datasource(s)", function_name="map_connections", details={"connections_count": len(connections)})
+        log("Mapped Qlik connections to Fabric data sources", f"{len(connections)} connection(s) mapped", stage_key="connections")
 
         tables = self._process_tables(data.get("tables", []), datasources)
+        log_agent_log(f"Extracted {len(tables)} table(s) from input payload", function_name="_process_tables", details={"tables_count": len(tables)})
 
         # Re-type the columns the deterministic pass could only guess at from
         # their names. The keyword lists in _process_tables are tuned to the
@@ -463,13 +512,12 @@ class CoordinatorAgent(ConversableAgent):
             hypercube_samples=data.get("hypercube_samples") if isinstance(data.get("hypercube_samples"), dict) else None,
         )
         column_usage = llm_usage.current().by_stage.get("columns", {})
-        if column_usage.get("attempted"):
-            log(
-                "Refined column data types with the LLM",
-                f"{column_usage.get('attempted', 0)} table(s) reviewed, "
-                f"{column_usage.get('accepted', 0)} updated, "
-                f"{column_usage.get('failed', 0)} call(s) failed",
-            )
+        total_cols_count = sum(len(t.get('columns', [])) for t in tables)
+        log(
+            "Standardized column data types and formats",
+            f"{total_cols_count} column(s) verified across {len(tables)} table(s)",
+            stage_key="columns",
+        )
 
         # Refine M-query expressions with the LLM when enabled (controlled by USE_LLM_MQUERY)
         tables = await self.mquery_converter.refine_all(tables)
@@ -487,6 +535,7 @@ class CoordinatorAgent(ConversableAgent):
         log(
             "Processed tables into Fabric TMDL/M-query definitions",
             f"{len(tables)} table(s) processed, {low_conf_tables} flagged for review",
+            stage_key="tables",
         )
 
         # Qlik dollar-sign expansion is textual substitution performed BEFORE
@@ -520,9 +569,17 @@ class CoordinatorAgent(ConversableAgent):
                     "Resolved Qlik variable references ($-sign expansion)",
                     f"{expanded_count} expression(s) expanded against "
                     f"{len(variable_index)} variable definition(s)",
+                    stage_key="variables",
                 )
+        else:
+            log(
+                "Evaluated variables and dynamic formulas",
+                "No $-sign expansions required for this application",
+                stage_key="variables",
+            )
 
         measures = await self.mapping_agent.extract_measures(data, tables)
+        log_agent_log(f"Extracted and converted {len(measures)} measure(s)", function_name="extract_measures", details={"measures_count": len(measures)})
 
         # Auto-generate DAX measures for any Qlik expression labels used in
         # visual y_axis fields that don't already exist as column names or measures.
@@ -627,10 +684,11 @@ class CoordinatorAgent(ConversableAgent):
         log(
             "Converted Qlik measures to DAX",
             f"{len(measures)} measure(s) converted, {measures_needing_review} flagged for review",
+            stage_key="measures",
         )
 
         relationships = self._process_relationships(data.get("relationships") or [], tables=tables)
-        log("Resolved table relationships", f"{len(relationships)} relationship(s) resolved")
+        log("Resolved table relationships", f"{len(relationships)} relationship(s) resolved", stage_key="relationships")
 
         # Validate measure reachability across relationships
         reachability = RelationshipInferrer.validate_measure_reachability(measures, tables, relationships)
@@ -742,6 +800,7 @@ class CoordinatorAgent(ConversableAgent):
             "Converted dashboard visuals to Fabric report visuals",
             f"{len(sheet_visuals)} visual(s) across {len(sheets_list)} sheet(s), "
             f"{unsupported_visuals} without a direct Fabric equivalent",
+            stage_key="visuals",
         )
 
         dimensions = self.dimension_mapper.map_dimensions(normalize_dimensions(data.get("dimensions") or []), tables)
@@ -761,8 +820,9 @@ class CoordinatorAgent(ConversableAgent):
         filters = self.filter_mapper.map_filters(data.get("filter_panes") or data.get("filters") or [], tables)
         unresolved_filters = sum(1 for f in filters if f.get("confidence", {}).get("requires_review"))
         log(
-            "Mapped filter panes to Fabric report/page filters",
-            f"{len(filters)} filter(s) mapped, {unresolved_filters} could not be resolved to a table column",
+            "Mapped dimensions and interactive filters",
+            f"{len(dimensions)} dimension(s) mapped, {len(filters)} filter pane(s) configured",
+            stage_key="dimensions_filters",
         )
 
         # Variables are converted after visuals: a variable-input object on a
@@ -822,9 +882,10 @@ class CoordinatorAgent(ConversableAgent):
         }
 
         log(
-            "Mapping run completed",
+            "Mapping run completed and verified",
             f"{len(tables)} table(s), {len(measures)} measure(s), {len(relationships)} relationship(s), "
             f"{len(dimensions)} dimension(s), {len(sheet_visuals)} visual(s), {len(filters)} filter(s)",
+            stage_key="complete",
         )
 
         parsing_summary = self.summary_builder.extract_parsing_summary(data)

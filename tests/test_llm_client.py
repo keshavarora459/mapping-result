@@ -31,9 +31,20 @@ def _fake_response(payload):
     return msg
 
 
+import pytest
+from src.converters.llm_cache import get_llm_cache
+
+@pytest.fixture(autouse=True)
+def reset_cache():
+    get_llm_cache().clear()
+    yield
+    get_llm_cache().clear()
+
+
 def test_retries_transient_rate_limit_then_succeeds(monkeypatch):
     monkeypatch.setattr(config.Config, "GROQ_API_KEY", "test-key")
     monkeypatch.setattr(config.Config, "RETRY_DELAY", 0.001)
+    monkeypatch.setattr(config.Config, "MAX_RETRIES", 2)
     client = GroqLLMClient()
     attempts = {"n": 0}
 

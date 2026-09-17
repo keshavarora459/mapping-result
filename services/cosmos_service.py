@@ -23,7 +23,7 @@ import os
 def _get_base_apis() -> list:
     """Collect configured MongoDB API endpoints from environment variables."""
     apis = []
-    for env_var in ["COSMOS_BASE_API", "MONGO_API_URL", "QLIK_MONGO_API_URL", "COSMOS_DB_API", "BASE_API_URL"]:
+    for env_var in ["BASE_API_URL", "AGENT_ACTIONS_API_URL", "COSMOS_BASE_API", "MONGO_API_URL", "QLIK_MONGO_API_URL", "COSMOS_DB_API"]:
         val = os.getenv(env_var)
         if val and val.strip():
             clean_val = val.strip().rstrip("/")

@@ -110,7 +110,9 @@ class BaseConverter:
             f"Convert the following item based on the rules.\nItem Data:\n"
             f"{json.dumps(payload, indent=2, default=str)}\n\nRules:\n{json.dumps(rules, indent=2)}"
         )
-        return await context.llm_client.generate_structured_response(system_prompt, user_prompt, schema)
+        return await context.llm_client.generate_structured_response(
+            system_prompt, user_prompt, schema, stage=getattr(self, "name", "visuals")
+        )
 
     async def _call_llm_prompts(
         self, context: ConversionContext, system_prompt: str, user_prompt: str, schema: dict
@@ -121,7 +123,9 @@ class BaseConverter:
         prompts aren't forced through the generic "here is the item, here are
         the rules" envelope.
         """
-        return await context.llm_client.generate_structured_response(system_prompt, user_prompt, schema)
+        return await context.llm_client.generate_structured_response(
+            system_prompt, user_prompt, schema, stage=getattr(self, "name", "visuals")
+        )
 
     async def convert_one(self, item: Any, context: ConversionContext) -> ConvertedItem:
         raise NotImplementedError("Subclasses must implement convert_one")

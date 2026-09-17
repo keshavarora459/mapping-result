@@ -23,6 +23,10 @@ class LLMUsage:
     attempted: int = 0
     succeeded: int = 0
     failed: int = 0
+    rate_limited: int = 0
+    cache_hits: int = 0
+    deterministic_conversions: int = 0
+    fallback_conversions: int = 0
     # Model output accepted over the deterministic baseline.
     accepted: int = 0
     # Model answered, but validation rejected it and the baseline was kept.
@@ -33,7 +37,17 @@ class LLMUsage:
     def _stage(self, stage: str) -> Dict[str, int]:
         return self.by_stage.setdefault(
             stage,
-            {"attempted": 0, "succeeded": 0, "failed": 0, "accepted": 0, "rejected": 0},
+            {
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "rate_limited": 0,
+                "cache_hits": 0,
+                "deterministic_conversions": 0,
+                "fallback_conversions": 0,
+                "accepted": 0,
+                "rejected": 0,
+            },
         )
 
     def record_attempt(self, stage: str) -> None:
@@ -43,6 +57,24 @@ class LLMUsage:
     def record_success(self, stage: str) -> None:
         self.succeeded += 1
         self._stage(stage)["succeeded"] += 1
+
+    def record_cache_hit(self, stage: str) -> None:
+        self.cache_hits += 1
+        self._stage(stage)["cache_hits"] = self._stage(stage).get("cache_hits", 0) + 1
+
+    def record_deterministic(self, stage: str) -> None:
+        self.deterministic_conversions += 1
+        self._stage(stage)["deterministic_conversions"] = self._stage(stage).get("deterministic_conversions", 0) + 1
+
+    def record_fallback(self, stage: str) -> None:
+        self.fallback_conversions += 1
+        self._stage(stage)["fallback_conversions"] = self._stage(stage).get("fallback_conversions", 0) + 1
+
+    def record_rate_limited(self, stage: str, reason: str = "429 rate limit") -> None:
+        self.rate_limited += 1
+        self._stage(stage)["rate_limited"] = self._stage(stage).get("rate_limited", 0) + 1
+        if reason and len(self.failures) < 20:
+            self.failures.append(f"{stage} [rate_limited]: {reason}"[:300])
 
     def record_failure(self, stage: str, reason: str = "") -> None:
         self.failed += 1
@@ -65,6 +97,10 @@ class LLMUsage:
             "attempted": self.attempted,
             "succeeded": self.succeeded,
             "failed": self.failed,
+            "rate_limited": self.rate_limited,
+            "cache_hits": self.cache_hits,
+            "deterministic_conversions": self.deterministic_conversions,
+            "fallback_conversions": self.fallback_conversions,
             "accepted": self.accepted,
             "rejected": self.rejected,
             "by_stage": self.by_stage,

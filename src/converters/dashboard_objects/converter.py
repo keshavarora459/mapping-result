@@ -378,6 +378,7 @@ class DashboardObjectConverter(BaseConverter):
                     "rationale": f"LLM classification failed ({exc}); used rule-based mapping."
                 }
         else:
+            usage.record_deterministic(STAGE)
             # Deterministic fast path: construct standard field roles
             dims = item.get("dimensions") or item.get("x_axis") or []
             meas = item.get("measures") or item.get("y_axis") or item.get("expressions_and_formulas") or []

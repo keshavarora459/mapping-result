@@ -9,3 +9,5 @@ htmlcov/
 *.log
 venv/
 *.pyc
+scratch/
+response.json
