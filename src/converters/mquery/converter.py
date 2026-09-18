@@ -169,7 +169,18 @@ class MQueryConverter:
                 connection_context=self._connection_context(table),
                 upstream_tables=known_queries,
             )
-            answer = await self.llm_client.generate_text(system, user, stage=STAGE)
+            schema = {
+                "type": "object",
+                "properties": {
+                    "m_query": {
+                        "type": "string",
+                        "description": "The converted Power Query M expression starting with 'let' and ending with the 'in' clause."
+                    }
+                },
+                "required": ["m_query"]
+            }
+            answer_dict = await self.llm_client.generate_structured_response(system, user, schema, stage=STAGE)
+            answer = answer_dict.get("m_query", "")
             usage.record_success(STAGE)
         except Exception as exc:  # noqa: BLE001
             usage.record_failure(STAGE, str(exc))
@@ -179,12 +190,31 @@ class MQueryConverter:
             )
             table["conversion_method"] = "regex_fallback"
             table["llm_status"] = "rate_limited" if "rate" in str(exc).lower() else "failed"
+            
+            # If the baseline is empty, we must provide a fallback so m_query isn't null.
+            if not str(baseline).strip():
+                from services.connection_mapper import ConnectionMapper
+                fallback_m = f'let\n    Source = {name}\nin\n    Source'
+                table["m_expression"] = fallback_m
+                table["m_query"] = ConnectionMapper().parse_mquery_to_steps(fallback_m)
             return table
+
+        if answer is None:
+            answer = ""
+        elif not isinstance(answer, str):
+            answer = str(answer)
 
         candidate = strip_fences(answer)
         if not candidate:
             usage.record_rejected(STAGE, "model returned nothing usable")
             table["conversion_method"] = "regex_fallback"
+            
+            # If the baseline is empty, we must provide a fallback so m_query isn't null.
+            if not str(baseline).strip():
+                from services.connection_mapper import ConnectionMapper
+                fallback_m = f'let\n    Source = {name}\nin\n    Source'
+                table["m_expression"] = fallback_m
+                table["m_query"] = ConnectionMapper().parse_mquery_to_steps(fallback_m)
             return table
 
         ok, problems = validate_mquery(candidate, name, known_queries)
@@ -195,6 +225,13 @@ class MQueryConverter:
                 name, "; ".join(problems[:3]),
             )
             table["conversion_method"] = "regex_fallback"
+            
+            # If the baseline is empty, retaining the rejected LLM candidate is better than returning null.
+            if not str(baseline).strip():
+                from services.connection_mapper import ConnectionMapper
+                table["m_expression"] = candidate
+                table["m_query"] = ConnectionMapper().parse_mquery_to_steps(candidate)
+                
             return table
 
         if candidate.strip() == str(baseline).strip():
@@ -237,8 +274,6 @@ class MQueryConverter:
                 baseline = str(raw_m or "")
 
             t_name = str(table.get("name") or table.get("table_name") or "")
-            if not baseline or not baseline.strip():
-                continue
 
             # Deterministic first: if baseline M-query is already structurally valid, skip LLM!
             is_valid, _ = validate_mquery(baseline, t_name, known)
@@ -246,6 +281,12 @@ class MQueryConverter:
                 usage.record_deterministic(STAGE)
                 table["conversion_method"] = "deterministic_rule"
                 table["llm_status"] = "not_needed"
+                
+                if not baseline.strip():
+                    from services.connection_mapper import ConnectionMapper
+                    fallback_m = f'let\n    Source = {t_name}\nin\n    Source'
+                    table["m_expression"] = fallback_m
+                    table["m_query"] = ConnectionMapper().parse_mquery_to_steps(fallback_m)
             else:
                 targets.append((table, str(baseline)))
 

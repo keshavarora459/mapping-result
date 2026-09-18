@@ -8,6 +8,9 @@ class MockLLMClient:
     async def generate_text(self, system: str, user: str, *args, **kwargs) -> str:
         return self.response
 
+    async def generate_structured_response(self, system: str, user: str, schema: dict, *args, **kwargs) -> dict:
+        return {"m_query": self.response}
+
 @pytest.mark.asyncio
 async def test_llm_mquery_converter_refines_table():
     llm_output = (

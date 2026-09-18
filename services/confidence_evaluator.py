@@ -38,12 +38,13 @@ class ConfidenceEvaluator:
         self,
         table_name: str,
         load_type: str,
-        mquery: str,
+        mquery: Optional[str],
         unresolved: List[str],
         expected_source_function: Optional[str] = None,
         upstream_table: Optional[str] = None,
         columns: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        mquery = mquery or ""
         # 1. lib:// path detection: hard fail if raw lib:// or Folder.Files("'lib:") exists in M
         has_lib_path = "lib://" in mquery or 'Folder.Files("\'lib:' in mquery or "Folder.Files(\"lib:" in mquery
 

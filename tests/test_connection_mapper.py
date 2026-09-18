@@ -49,7 +49,7 @@ def test_embedded_double_quotes_are_escaped_for_m():
 def test_unresolvable_driver_falls_back_to_placeholder():
     mapper = ConnectionMapper()
     mquery = mapper.build_table_mquery("Orders", "source", None, {"driver": "unknown_thing"}, None)
-    assert mquery == "let\n    Source = Orders\nin\n    Source"
+    assert mquery is None
 
 
 def test_resident_load_ignores_connection():

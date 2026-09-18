@@ -349,8 +349,14 @@ class ConnectionMapper:
             name = c.get("name") or c.get("lib_name") or "Connection"
             driver = (c.get("driver") or c.get("connector_type") or "").lower()
             connector = (c.get("source_connector") or c.get("connector_type") or "").lower()
-            server = c.get("server") or ""
             
+            # Fallback to parse server and db from connection_string if available
+            conn_str = str(c.get("connection_string") or c.get("connect_string") or "")
+            server_match = re.search(r"(?:Server|Host|Data\s*Source|Address)\s*=\s*([^;]+)", conn_str, re.IGNORECASE)
+            db_match = re.search(r"(?:Database|Initial\s*Catalog|DB)\s*=\s*([^;]+)", conn_str, re.IGNORECASE)
+            
+            server = c.get("server") or c.get("host") or (server_match.group(1).strip() if server_match else "")
+            db_extracted = c.get("database") or c.get("db") or (db_match.group(1).strip() if db_match else None)
             # Intelligent default port per connector
             combined_tag = f"{driver} {connector} {name.lower()}"
             if "redshift" in combined_tag:
@@ -371,7 +377,7 @@ class ConnectionMapper:
                 default_port = "443"
 
             port = c.get("port") or default_port
-            db = c.get("database") or c.get("db") or ("dev" if "redshift" in combined_tag else None)
+            db = db_extracted or ("dev" if "redshift" in combined_tag else None)
             path = c.get("path") or ""
             warehouse = c.get("warehouse") or ("COMPUTE_WH" if "snowflake" in combined_tag else None)
 
@@ -571,11 +577,13 @@ class ConnectionMapper:
         columns: Optional[List[Dict[str, Any]]] = None,
         connection: Optional[Dict[str, Any]] = None,
         registry: Optional[Any] = None,
-    ) -> str:
+    ) -> Optional[str]:
         res = self._build_raw_table_mquery(
             table_name, load_type, upstream_table, conn_details,
             custom_sql, qlik_query, columns, connection
         )
+        if res is None:
+            return None
         return self._post_process_mquery(res, qlik_query, registry=registry)
 
     def _build_raw_table_mquery(
@@ -760,9 +768,14 @@ class ConnectionMapper:
         conn = conn_details or {}
         driver = (conn.get("driver") or conn.get("connector_type") or "").lower()
         connector = (conn.get("source_connector") or conn.get("connector_type") or "").lower()
-        server = conn.get("server") or conn.get("host") or os.getenv("DEFAULT_DB_SERVER", "")
+        
+        conn_str = str(conn.get("connection_string") or conn.get("connect_string") or "")
+        server_match = re.search(r"(?:Server|Host|Data\s*Source|Address)\s*=\s*([^;]+)", conn_str, re.IGNORECASE)
+        db_match = re.search(r"(?:Database|Initial\s*Catalog|DB)\s*=\s*([^;]+)", conn_str, re.IGNORECASE)
+        
+        server = conn.get("server") or conn.get("host") or (server_match.group(1).strip() if server_match else None) or os.getenv("DEFAULT_DB_SERVER", "")
         port = str(conn.get("port") or ("5439" if "redshift" in (driver + connector) else "5432" if "postgres" in (driver + connector) else "1433" if "sql" in (driver + connector) else "3306" if "mysql" in (driver + connector) else os.getenv("DEFAULT_DB_PORT", "")))
-        db = conn.get("database") or conn.get("db") or os.getenv("DEFAULT_DB_NAME", "")
+        db = conn.get("database") or conn.get("db") or (db_match.group(1).strip() if db_match else None) or os.getenv("DEFAULT_DB_NAME", "")
         warehouse = conn.get("warehouse") or conn.get("warehouse_name") or os.getenv("DEFAULT_WAREHOUSE", "COMPUTE_WH")
         if not custom_sql and qlik_query:
             custom_sql = extract_embedded_sql(qlik_query)
@@ -826,55 +839,45 @@ class ConnectionMapper:
                 clean_sql = f"SELECT * FROM {schema}.{object_name}"
             else:
                 clean_sql = f"SELECT * FROM {object_name}"
+            base_m = spec.table_query(server, port, db, warehouse, conn.get("path") or "", escape_m_string(clean_sql), project)
             
-            t_name_lower = table_name.lower()
-            if t_name_lower == "trips":
-                server_part = f'{server.split(":")[0] if ":" in (server or "") else (server or "")}:{port or 5439}'
-                return (
-                    f'let\n'
-                    f'    Source = AmazonRedshift.Database("{server_part}", "{db or "dev"}"),\n'
-                    f'    Result = Value.NativeQuery(Source, "{escape_m_string(clean_sql)}", null, [EnableFolding=false]),\n'
-                    f'    #"Merged TruckMap" = Table.NestedJoin(Result, {{"truck_id"}}, TruckMap, {{"truck_id"}}, "__TruckMap_Table__", JoinKind.LeftOuter),\n'
-                    f'    #"Expanded TruckMap" = Table.ExpandTableColumn(#"Merged TruckMap", "__TruckMap_Table__", {{"unit_number"}}, {{"__TruckMap_Val__"}}),\n'
-                    f'    #"Added TruckNumber" = Table.AddColumn(#"Expanded TruckMap", "TruckNumber", each if [__TruckMap_Val__] <> null then Text.From([__TruckMap_Val__]) else "Unknown", type text),\n'
-                    f'    #"Removed Temp TruckMap" = Table.RemoveColumns(#"Added TruckNumber", {{"__TruckMap_Table__", "__TruckMap_Val__"}}),\n'
-                    f'    #"Added DispatchDate" = Table.AddColumn(#"Removed Temp TruckMap", "DispatchDate", each Date.From([dispatch_date]), type date),\n'
-                    f'    #"Added TripMonth" = Table.AddColumn(#"Added DispatchDate", "TripMonth", each Date.Month([DispatchDate]), Int64.Type),\n'
-                    f'    #"Added LoadMonth" = Table.AddColumn(#"Added TripMonth", "LoadMonth", each Date.Month([DispatchDate]), Int64.Type),\n'
-                    f'    #"Added MonthStartDate" = Table.AddColumn(#"Added LoadMonth", "MonthStartDate", each Date.StartOfMonth([DispatchDate]), type date),\n'
-                    f'    #"Added MonthYear" = Table.AddColumn(#"Added MonthStartDate", "MonthYear", each Date.ToText([DispatchDate], "MMM yyyy"), type text),\n'
-                    f'    #"Added MonthSort" = Table.AddColumn(#"Added MonthYear", "MonthSort", each Date.Year([DispatchDate]) * 100 + Date.Month([DispatchDate]), Int64.Type),\n'
-                    f'    #"Added TripYear" = Table.AddColumn(#"Added MonthSort", "TripYear", each Date.Year([DispatchDate]), Int64.Type),\n'
-                    f'    #"Added TripWeek" = Table.AddColumn(#"Added TripYear", "TripWeek", each Date.WeekOfYear([DispatchDate]), Int64.Type),\n'
-                    f'    #"Added MonthNo" = Table.AddColumn(#"Added TripWeek", "MonthNo", each Date.Month([DispatchDate]), Int64.Type),\n'
-                    f'    #"Added DistanceBand" = Table.AddColumn(#"Added MonthNo", "DistanceBand", each if [actual_distance_miles] >= 1000 then "Long Haul" else if [actual_distance_miles] >= 500 then "Medium Haul" else "Short Haul", type text),\n'
-                    f'    #"Added FuelEfficiencyBand" = Table.AddColumn(#"Added DistanceBand", "FuelEfficiencyBand", each if [average_mpg] >= 8 then "High MPG" else if [average_mpg] >= 6 then "Medium MPG" else "Low MPG", type text),\n'
-                    f'    #"Added IdleTimeBand" = Table.AddColumn(#"Added FuelEfficiencyBand", "IdleTimeBand", each if [idle_time_hours] >= 5 then "High Idle" else if [idle_time_hours] >= 2 then "Moderate Idle" else "Low Idle", type text)\n'
-                    f'in\n'
-                    f'    #"Added IdleTimeBand"'
-                )
-            if t_name_lower == "drivers":
-                server_part = f'{server.split(":")[0] if ":" in (server or "") else (server or "")}:{port or 5439}'
-                return (
-                    f'let\n'
-                    f'    Source = AmazonRedshift.Database("{server_part}", "{db or "dev"}"),\n'
-                    f'    Result = Value.NativeQuery(Source, "{escape_m_string(clean_sql)}", null, [EnableFolding=false]),\n'
-                    f'    #"Added DriverName" = Table.AddColumn(Result, "DriverName", each Text.Trim(Text.Combine({{[first_name], [last_name]}}, " ")), type text),\n'
-                    f'    #"Added HOME_TERMINAL" = Table.AddColumn(#"Added DriverName", "HOME_TERMINAL", each Text.Upper(Text.Trim([home_terminal])), type text)\n'
-                    f'in\n'
-                    f'    #"Added HOME_TERMINAL"'
-                )
-            if t_name_lower == "loads":
-                server_part = f'{server.split(":")[0] if ":" in (server or "") else (server or "")}:{port or 5439}'
-                return (
-                    f'let\n'
-                    f'    Source = AmazonRedshift.Database("{server_part}", "{db or "dev"}"),\n'
-                    f'    Result = Value.NativeQuery(Source, "{escape_m_string(clean_sql)}", null, [EnableFolding=false]),\n'
-                    f'    #"Added RevenueBand" = Table.AddColumn(Result, "RevenueBand", each if [revenue] >= 6000 then "High Value" else if [revenue] >= 3000 then "Medium Value" else "Low Value", type text)\n'
-                    f'in\n'
-                    f'    #"Added RevenueBand"'
-                )
-            return spec.table_query(server, port, db, warehouse, conn.get("path") or "", escape_m_string(clean_sql), project)
+            parts = re.split(r"\n\s*in\s*\n", base_m, maxsplit=1)
+            if len(parts) == 2:
+                let_block = parts[0]
+                last_step = parts[1].strip()
+                steps_to_add = []
+                
+                rename_pairs = []
+                if qlik_query:
+                    for match in re.finditer(r"\[([^\]]+)\]\s+AS\s+\[([^\]]+)\]", qlik_query, re.IGNORECASE):
+                        old_col, new_col = match.group(1), match.group(2)
+                        if old_col.lower() != new_col.lower():
+                            rename_pairs.append((old_col, new_col))
+                    for match in re.finditer(r"\b([A-Za-z0-9_]+)\s+AS\s+([A-Za-z0-9_]+)\b", qlik_query, re.IGNORECASE):
+                        old_col, new_col = match.group(1), match.group(2)
+                        if old_col.lower() not in ("load", "select", "from", "where", "group", "by", "as", "resident") and old_col.lower() != new_col.lower():
+                            if not any(old == old_col for old, _ in rename_pairs):
+                                rename_pairs.append((old_col, new_col))
+
+                if rename_pairs:
+                    rename_expr = build_rename_step(last_step, rename_pairs)
+                    if rename_expr != last_step:
+                        next_step = '#"Renamed Columns"'
+                        steps_to_add.append(f'    {next_step} = {rename_expr}')
+                        last_step = next_step
+                
+                type_expr = build_type_step(last_step, columns)
+                if type_expr != last_step:
+                    next_step = '#"Changed Type"'
+                    steps_to_add.append(f'    {next_step} = {type_expr}')
+                    last_step = next_step
+                
+                if steps_to_add:
+                    let_block = let_block + ",\n" + ",\n".join(steps_to_add)
+                
+                return f"{let_block}\nin\n    {last_step}"
+            
+            return base_m
 
         # Check for INLINE load in Qlik script
         inline_match = re.search(r"INLINE\s*\[\s*(.*?)\s*\]", qlik_query or "", re.IGNORECASE | re.DOTALL)
@@ -1030,9 +1033,11 @@ class ConnectionMapper:
             elif "crosstable" in qlik_query.lower():
                 return f'let\n    Source = {SourceResolver.escape_identifier(upstream_table or table_name + "_Raw")},\n    #"Unpivoted Other Columns" = Table.UnpivotOtherColumns(Source, {{"ID"}}, "Attribute", "Value")\nin\n    #"Unpivoted Other Columns"'
 
-        return f"let\n    Source = {SourceResolver.escape_identifier(table_name)}\nin\n    Source"
+        return None
 
-    def parse_mquery_to_steps(self, mquery: str) -> List[Dict[str, Any]]:
+    def parse_mquery_to_steps(self, mquery: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+        if not mquery:
+            return None
         steps = []
         if mquery.startswith("let\n") or mquery.startswith("let\r\n") or mquery.startswith("let "):
             body = mquery[3:].strip()

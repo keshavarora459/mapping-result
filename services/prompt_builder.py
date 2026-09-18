@@ -260,7 +260,8 @@ def build_mquery_prompts(
         "You are an expert data engineer converting Qlik Sense load scripts into "
         "Power Query M for a Microsoft Fabric semantic model.\n\n"
         "CRITICAL OUTPUT CONTRACT:\n"
-        "- Output ONLY the M expression, starting with 'let' and ending with the 'in'\n"
+        "- Output ONLY a JSON object containing the 'm_query' key.\n"
+        "- The 'm_query' value MUST be the M expression, starting with 'let' and ending with the 'in'\n"
         "  clause. No markdown, no fences, no commentary.\n"
         "- M is case-sensitive. Text.Upper is valid; TEXT.UPPER is not.\n"
         "- Never invent a server, database, schema, path or credential. Use only what\n"
@@ -280,7 +281,7 @@ def build_mquery_prompts(
         + strip_qlik_comments(str(table.get("qlik_query") or ""))[:3000]
         + "\n\nDETERMINISTIC DRAFT (repair it, or return it unchanged if already correct):\n"
         + str(baseline_mquery)[:3000]
-        + "\n\nM expression only:"
+        + "\n\nReturn the JSON object described by the schema."
     )
     return system, user
 

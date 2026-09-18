@@ -254,7 +254,9 @@ class TMDLGenerator:
     def generate_uuid(self, seed: str) -> str:
         return stable_lineage_tag(seed)
 
-    def generate_table_tmdl(self, table_name: str, columns: List[Dict[str, Any]], mquery: str) -> Dict[str, Any]:
+    def generate_table_tmdl(self, table_name: str, columns: List[Dict[str, Any]], mquery: Optional[str]) -> Dict[str, Any]:
+        """Generate a dictionary representation of the TMDL definition for a table."""
+        mquery = mquery or ""
         tbl_lineage = self.generate_uuid(f"table:{table_name}")
 
         cols_metadata = []
